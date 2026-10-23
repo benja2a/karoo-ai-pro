@@ -17,7 +17,6 @@ import io.hammerhead.karooext.models.DataType
 import io.hammerhead.karooext.models.InRideAlert
 import io.hammerhead.karooext.models.OnLocationChanged
 import io.hammerhead.karooext.models.OnStreamState
-import io.hammerhead.karooext.models.PlayBeepPattern
 import io.hammerhead.karooext.models.StreamState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -198,34 +197,57 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
         }
     }
 
+    /**
+     * Safely extracts the single numeric value from an OnStreamState event.
+     */
+    private fun extractSingleValue(event: Any): Double? {
+        return try {
+            val streaming = event.javaClass.declaredFields.firstNotNullOfOrNull { f ->
+                f.isAccessible = true
+                f.get(event) as? StreamState.Streaming
+            } ?: return null
+            val dp = streaming.javaClass.declaredFields.firstNotNullOfOrNull { f ->
+                f.isAccessible = true
+                f.get(streaming) as? DataPoint
+            } ?: return null
+            val map = dp.javaClass.declaredFields.firstNotNullOfOrNull { f ->
+                f.isAccessible = true
+                f.get(dp) as? Map<*, *>
+            }
+            (map?.get(DataType.Field.SINGLE) as? Number)?.toDouble()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun subscribeToKarooStreams() {
         karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.POWER)) { event ->
-            (event.state as? StreamState.Streaming)?.dataPoint?.singleValue?.let {
+            extractSingleValue(event)?.let {
                 latestPower = it.toInt()
             }
         }
         karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.HEART_RATE)) { event ->
-            (event.state as? StreamState.Streaming)?.dataPoint?.singleValue?.let {
+            extractSingleValue(event)?.let {
                 latestHr = it.toInt()
             }
         }
         karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.CADENCE)) { event ->
-            (event.state as? StreamState.Streaming)?.dataPoint?.singleValue?.let {
+            extractSingleValue(event)?.let {
                 latestCadence = it.toInt()
             }
         }
         karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.SPEED)) { event ->
-            (event.state as? StreamState.Streaming)?.dataPoint?.singleValue?.let {
+            extractSingleValue(event)?.let {
                 latestSpeedKmh = it * 3.6 // m/s to km/h
             }
         }
         karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.DISTANCE)) { event ->
-            (event.state as? StreamState.Streaming)?.dataPoint?.singleValue?.let {
+            extractSingleValue(event)?.let {
                 latestDistanceKm = it / 1000.0
             }
         }
         karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.ELEVATION_GRADE)) { event ->
-            (event.state as? StreamState.Streaming)?.dataPoint?.singleValue?.let {
+            extractSingleValue(event)?.let {
                 latestGradePct = it
             }
         }
@@ -273,9 +295,6 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
                             backgroundColor = android.R.color.holo_blue_dark,
                             textColor = android.R.color.white
                         )
-                    )
-                    karooSystem.dispatch(
-                        PlayBeepPattern(listOf(PlayBeepPattern.Step(1200, 150)))
                     )
                 }
                 delay(1000L)
