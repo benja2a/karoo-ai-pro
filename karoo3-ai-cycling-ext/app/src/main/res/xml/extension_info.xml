@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ExtensionInfo
+    id="karoo-ai-pro"
+    displayName="@string/extension_name"
+    icon="@android:drawable/ic_menu_compass"
+    scansDevices="false">
+
+    <!-- 1. Real-Time Wind Vector & Headwind/Crosswind Field (Open-Meteo + GPS Heading) -->
+    <DataType
+        typeId="wind-vector-hud"
+        displayName="@string/dt_wind_vector_name"
+        description="@string/dt_wind_vector_desc"
+        graphical="true"
+        icon="@android:drawable/ic_menu_compass" />
+
+    <!-- 2. On-Device AI Adaptive Power & Pacing Coach Field -->
+    <DataType
+        typeId="ai-adaptive-target"
+        displayName="@string/dt_ai_target_name"
+        description="@string/dt_ai_target_desc"
+        graphical="true"
+        icon="@android:drawable/ic_menu_manage" />
+
+    <!-- 3. Skiba W' Balance (Anaerobic Work Capacity Reserve) -->
+    <DataType
+        typeId="w-prime-balance"
+        displayName="@string/dt_wprime_name"
+        description="@string/dt_wprime_desc"
+        graphical="false"
+        icon="@android:drawable/ic_lock_idle_charging" />
+
+    <!-- 4. TrainingPeaks Pro Metrics (NP / IF / TSS Summary) -->
+    <DataType
+        typeId="np-if-tss-summary"
+        displayName="@string/dt_nptss_name"
+        description="@string/dt_nptss_desc"
+        graphical="true"
+        icon="@android:drawable/ic_menu_sort_by_size" />
+
+    <!-- 5. AI Smart Carb & Hydration Countdown Field -->
+    <DataType
+        typeId="ai-fueling-timer"
+        displayName="@string/dt_fueling_name"
+        description="@string/dt_fueling_desc"
+        graphical="false"
+        icon="@android:drawable/ic_lock_idle_alarm" />
+
+    <!-- Bonus Action: Open Separate Full-Screen All-Metrics Window from Di2/AXS Hoods -->
+    <BonusAction
+        actionId="open-all-metrics-window"
+        displayName="@string/bonus_open_dashboard" />
+
+</ExtensionInfo>
