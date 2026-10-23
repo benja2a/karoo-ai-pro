@@ -6,7 +6,7 @@
     <string name="dt_wind_vector_desc">Live headwind, tailwind, crosswind speed and relative wind angle from Open-Meteo and GPS heading.</string>
     <string name="dt_ai_target_name">AI Adaptive Target Power</string>
     <string name="dt_ai_target_desc">On-device heuristic AI target wattage and tactical pacing prompt.</string>
-    <string name="dt_wprime_name">W' Balance (kJ)</string>
+    <string name="dt_wprime_name">"W\' Balance (kJ)"</string>
     <string name="dt_wprime_desc">Remaining anaerobic work capacity calculated using the Skiba differential model.</string>
     <string name="dt_nptss_name">NP / IF / TSS Block</string>
     <string name="dt_nptss_desc">30s Normalized Power, Intensity Factor, and Training Stress Score.</string>
