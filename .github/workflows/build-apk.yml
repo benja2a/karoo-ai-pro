@@ -27,10 +27,23 @@ jobs:
         env:
           USERNAME: ${{ github.actor }}
           TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || github.token }}
-        run: gradle assembleDebug --no-daemon
+        run: |
+          if [ -f "build.gradle.kts" ]; then
+            echo "Compilando en el directorio raiz..."
+            gradle assembleDebug --no-daemon --stacktrace
+          elif [ -f "karoo3-ai-cycling-ext/build.gradle.kts" ]; then
+            echo "Detectada subcarpeta karoo3-ai-cycling-ext, ingresando..."
+            cd karoo3-ai-cycling-ext
+            gradle assembleDebug --no-daemon --stacktrace
+          else
+            echo "ERROR: No se encontro el archivo build.gradle.kts."
+            echo "Archivos encontrados en el repositorio:"
+            ls -la
+            exit 1
+          fi
 
       - name: Upload Karoo 3 APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: karoo3-ai-cycling-pro-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: "**/app/build/outputs/apk/debug/*.apk"
