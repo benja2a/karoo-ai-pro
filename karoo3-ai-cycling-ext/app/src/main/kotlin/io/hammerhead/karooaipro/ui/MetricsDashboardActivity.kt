@@ -1,7 +1,14 @@
 package io.hammerhead.karooaipro.ui
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.os.Bundle
 import android.view.KeyEvent
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
@@ -18,23 +25,100 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import io.hammerhead.karooaipro.engine.AiHeuristicEvaluation
 import io.hammerhead.karooaipro.engine.CyclingMetricsSnapshot
 import io.hammerhead.karooaipro.engine.WindVectorReport
+import io.hammerhead.karooaipro.extension.LiveSensorDiagnostics
 import io.hammerhead.karooaipro.extension.SharedTelemetryBus
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.floor
+import kotlin.math.ln
 import kotlin.math.sin
+import kotlin.math.tan
+
+/**
+ * Asynchronous Slippy-Map Tile Downloader & Memory Cache for the Native 3D Perspective Map.
+ * Supports OpenStreetMap (Calles), Esri World Imagery (Satélite 3D), and OpenTopoMap (Topográfico).
+ */
+object LiveTileMapEngine {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val tileCache = ConcurrentHashMap<String, ImageBitmap>()
+    private val inFlight = ConcurrentHashMap.newKeySet<String>()
+    private val versionCounter = AtomicInteger(0)
+
+    fun tileVersion(): Int = versionCounter.get()
+    fun cachedCount(): Int = tileCache.size
+
+    fun getOrFetchTile(styleIndex: Int, z: Int, x: Int, y: Int): ImageBitmap? {
+        val maxTile = (1 shl z)
+        if (y < 0 || y >= maxTile) return null
+        val wrappedX = ((x % maxTile) + maxTile) % maxTile
+        val key = "$styleIndex:$z:$wrappedX:$y"
+
+        tileCache[key]?.let { return it }
+
+        if (inFlight.add(key)) {
+            scope.launch {
+                try {
+                    val urlStr = when (styleIndex) {
+                        1 -> "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/$z/$y/$wrappedX"
+                        2 -> "https://a.tile.opentopomap.org/$z/$wrappedX/$y.png"
+                        else -> "https://tile.openstreetmap.org/$z/$wrappedX/$y.png"
+                    }
+                    val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        connectTimeout = 6500
+                        readTimeout = 6500
+                        setRequestProperty("User-Agent", "Karoo3AiCyclingPro/1.0 (Hammerhead Karoo 3)")
+                    }
+                    if (conn.responseCode == 200) {
+                        conn.inputStream.use { stream ->
+                            val bmp = BitmapFactory.decodeStream(stream)
+                            if (bmp != null) {
+                                if (tileCache.size > 160) {
+                                    tileCache.clear()
+                                }
+                                tileCache[key] = bmp.asImageBitmap()
+                                versionCounter.incrementAndGet()
+                            }
+                        }
+                    }
+                    conn.disconnect()
+                } catch (_: Exception) {
+                } finally {
+                    inFlight.remove(key)
+                }
+            }
+        }
+        return null
+    }
+}
 
 class MetricsDashboardActivity : ComponentActivity() {
 
@@ -42,11 +126,37 @@ class MetricsDashboardActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Start KarooSystemService + internal barometer + GPS immediately
+        SharedTelemetryBus.ensureStarted(applicationContext)
+
+        // Request GPS permission on Karoo 3 if not yet granted
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                ),
+                1001
+            )
+        }
+
         setContent {
             KarooMultiPageCockpit(
                 currentPage = pageState.intValue,
                 onSelectPage = { newPage -> pageState.intValue = (newPage + 4) % 4 }
             )
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1001) {
+            SharedTelemetryBus.startInternalHardwareSensors(applicationContext)
         }
     }
 
@@ -75,19 +185,23 @@ fun KarooMultiPageCockpit(
     onSelectPage: (Int) -> Unit
 ) {
     var telemetry by remember { mutableStateOf(SharedTelemetryBus.latestState()) }
+    var diag by remember { mutableStateOf(SharedTelemetryBus.latestDiagnostics()) }
     var subPage by remember { mutableIntStateOf(0) }
     var daylightMode by remember { mutableStateOf(false) }
-    var mapZoom by remember { mutableFloatStateOf(1.0f) }
+    var mapZoomLevel by remember { mutableIntStateOf(16) }
     var mapWindColorMode by remember { mutableStateOf(true) }
     var showClimber by remember { mutableStateOf(true) }
-    var extraCarbsLogged by remember { mutableIntStateOf(50) }
-    var extraHydrationMl by remember { mutableIntStateOf(600) }
-    var tickCount by remember { mutableIntStateOf(0) }
+    var extraCarbsLogged by remember { mutableIntStateOf(0) }
+    var extraHydrationMl by remember { mutableIntStateOf(0) }
+    var elapsedRideSec by remember { mutableIntStateOf(0) }
+    var tileRefreshTick by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(Unit) {
         while (true) {
             telemetry = SharedTelemetryBus.latestState()
-            tickCount += 1
+            diag = SharedTelemetryBus.latestDiagnostics()
+            elapsedRideSec += 1
+            tileRefreshTick = LiveTileMapEngine.tileVersion()
             delay(1000L)
         }
     }
@@ -99,7 +213,7 @@ fun KarooMultiPageCockpit(
     val primaryText = if (daylightMode) Color(0xFF0F172A) else Color(0xFFFFFFFF)
     val secondaryText = if (daylightMode) Color(0xFF475569) else Color(0xFF94A3B8)
 
-    val pageTitles = listOf("1/4 • MÉTRICAS", "2/4 • MAPA RUTA", "3/4 • VIENTO", "4/4 • IA COACH")
+    val pageTitles = listOf("1/4 • MÉTRICAS", "2/4 • MAPA 3D", "3/4 • VIENTO", "4/4 • IA COACH")
 
     Surface(
         modifier = Modifier
@@ -109,10 +223,12 @@ fun KarooMultiPageCockpit(
                 detectHorizontalDragGestures(
                     onDragStart = { totalDrag = 0f },
                     onDragEnd = {
-                        if (totalDrag < -60f) {
-                            onSelectPage(currentPage + 1)
-                        } else if (totalDrag > 60f) {
-                            onSelectPage(currentPage - 1)
+                        if (currentPage != 1) {
+                            if (totalDrag < -60f) {
+                                onSelectPage(currentPage + 1)
+                            } else if (totalDrag > 60f) {
+                                onSelectPage(currentPage - 1)
+                            }
                         }
                     },
                     onHorizontalDrag = { _, dragAmount ->
@@ -124,33 +240,46 @@ fun KarooMultiPageCockpit(
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
 
-            // TOP STATUS & DAYLIGHT BAR
+            // TOP STATUS, SENSOR DIAGNOSTICS & MODE BAR
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(Color(0xFF0D131F))
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                    .padding(horizontal = 8.dp, vertical = 5.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                val mins = (74 + tickCount / 60)
-                val secs = (tickCount % 60).toString().padStart(2, '0')
+                val hrs = (elapsedRideSec / 3600).toString().padStart(2, '0')
+                val mins = ((elapsedRideSec % 3600) / 60).toString().padStart(2, '0')
+                val secs = (elapsedRideSec % 60).toString().padStart(2, '0')
+                val gpsLabel = if (diag.gpsFixActive) "GPS 3D OK" else "BUSCANDO GPS"
                 Text(
-                    text = "01:${(mins % 60).toString().padStart(2, '0')}:$secs  •  GPS 3D",
-                    color = Color(0xFFFACC15),
-                    fontSize = 11.sp,
+                    text = "$hrs:$mins:$secs • $gpsLabel • ${diag.altitudeMeters.toInt()}m",
+                    color = if (diag.gpsFixActive) Color(0xFF34D399) else Color(0xFFFACC15),
+                    fontSize = 10.sp,
                     fontWeight = FontWeight.ExtraBold
                 )
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "${wind.temperatureC}°C",
-                        color = Color(0xFF2DD4BF),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Box(
+                        modifier = Modifier
+                            .background(
+                                if (diag.demoModeEnabled) Color(0xFFD97706) else Color(0xFF059669),
+                                RoundedCornerShape(6.dp)
+                            )
+                            .clickable { SharedTelemetryBus.setDemoMode(!diag.demoModeEnabled) }
+                            .padding(horizontal = 7.dp, vertical = 3.dp)
+                    ) {
+                        Text(
+                            text = if (diag.demoModeEnabled) "🧪 DEMO" else "🟢 REAL",
+                            color = Color.White,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
+
                     Box(
                         modifier = Modifier
                             .background(
@@ -158,7 +287,7 @@ fun KarooMultiPageCockpit(
                                 RoundedCornerShape(6.dp)
                             )
                             .clickable { daylightMode = !daylightMode }
-                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                            .padding(horizontal = 7.dp, vertical = 3.dp)
                     ) {
                         Text(
                             text = if (daylightMode) "☀️ DÍA" else "🌙 NOCHE",
@@ -170,6 +299,28 @@ fun KarooMultiPageCockpit(
                 }
             }
 
+            // LIVE SENSOR CONNECTION STATUS STRIP
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF111827))
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = if (diag.karooServiceConnected) "KAROO-EXT: CONECTADO (${diag.activeStreamsCount} sensores)" else "KAROO-EXT: VINCULANDO...",
+                    color = if (diag.karooServiceConnected) Color(0xFF38BDF8) else Color(0xFF94A3B8),
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = if (diag.barometerActive) "BARÓMETRO: ${diag.pressureHpa} hPa" else "CLIMA: ${wind.temperatureC}°C",
+                    color = Color(0xFF2DD4BF),
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
             // TOP 4-PAGE SELECTOR TABS
             Row(
                 modifier = Modifier
@@ -178,7 +329,7 @@ fun KarooMultiPageCockpit(
                     .padding(horizontal = 6.dp, vertical = 5.dp),
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                val tabs = listOf("Métricas", "🗺️ Mapa", "🌬️ Viento", "🧠 IA")
+                val tabs = listOf("Métricas", "🗺️ Mapa 3D", "🌬️ Viento", "🧠 IA")
                 tabs.forEachIndexed { idx, title ->
                     val active = currentPage == idx
                     Box(
@@ -213,6 +364,7 @@ fun KarooMultiPageCockpit(
                         metrics = metrics,
                         wind = wind,
                         ai = ai,
+                        diag = diag,
                         subPage = subPage,
                         onSelectSubPage = { subPage = it },
                         cardBg = cardBg,
@@ -224,19 +376,23 @@ fun KarooMultiPageCockpit(
                         metrics = metrics,
                         wind = wind,
                         ai = ai,
-                        mapZoom = mapZoom,
-                        onZoomIn = { mapZoom = (mapZoom + 0.2f).coerceAtMost(1.8f) },
-                        onZoomOut = { mapZoom = (mapZoom - 0.2f).coerceAtLeast(0.7f) },
+                        diag = diag,
+                        mapZoomLevel = mapZoomLevel,
+                        onZoomIn = { mapZoomLevel = (mapZoomLevel + 1).coerceAtMost(18) },
+                        onZoomOut = { mapZoomLevel = (mapZoomLevel - 1).coerceAtLeast(12) },
                         mapWindColorMode = mapWindColorMode,
                         onToggleColorMode = { mapWindColorMode = !mapWindColorMode },
                         showClimber = showClimber,
                         onToggleClimber = { showClimber = !showClimber },
                         daylightMode = daylightMode,
+                        tileRefreshTick = tileRefreshTick,
+                        elapsedRideSec = elapsedRideSec,
                         cardBg = cardBg,
                         borderCol = borderCol
                     )
                     2 -> WindRadarPageContent(
                         wind = wind,
+                        diag = diag,
                         cardBg = cardBg,
                         borderCol = borderCol,
                         primaryText = primaryText,
@@ -313,6 +469,7 @@ private fun AllMetricsPageContent(
     metrics: CyclingMetricsSnapshot,
     wind: WindVectorReport,
     ai: AiHeuristicEvaluation,
+    diag: LiveSensorDiagnostics,
     subPage: Int,
     onSelectSubPage: (Int) -> Unit,
     cardBg: Color,
@@ -402,7 +559,7 @@ private fun AllMetricsPageContent(
                     modifier = Modifier.weight(1f),
                     label = "3S POWER (${metrics.powerZoneName})",
                     value = "${metrics.power3s}W",
-                    subValue = "${metrics.ftpPercent}% FTP • Tgt ${ai.adaptiveTargetWatts}W",
+                    subValue = "Inst: ${metrics.powerInstant}W • ${metrics.ftpPercent}% FTP",
                     accentColor = Color(0xFFFACC15),
                     cardBg = cardBg,
                     borderCol = borderCol,
@@ -484,9 +641,9 @@ private fun AllMetricsPageContent(
                 )
                 MetricTile(
                     modifier = Modifier.weight(1f),
-                    label = "PENDIENTE / VAM",
+                    label = "PENDIENTE / ALT",
                     value = "${metrics.gradePercent}%",
-                    subValue = "${metrics.vamMetersPerHour} m/h",
+                    subValue = "${diag.altitudeMeters.toInt()}m • VAM ${metrics.vamMetersPerHour}",
                     accentColor = Color(0xFFF59E0B),
                     cardBg = cardBg,
                     borderCol = borderCol,
@@ -503,7 +660,7 @@ private fun AllMetricsPageContent(
                     modifier = Modifier.weight(1f),
                     label = headLabel,
                     value = "${abs(wind.headwindKmh)} km/h",
-                    subValue = "Aero ${if (wind.aeroPowerImpactWatts >= 0) "+" else ""}${wind.aeroPowerImpactWatts}W",
+                    subValue = "Aero ${if (wind.aeroPowerImpactWatts >= 0) "+" else ""}${wind.aeroPowerImpactWatts}W • Rumbo ${wind.riderHeadingDeg}°",
                     accentColor = if (wind.headwindKmh >= 0) Color(0xFFF97316) else Color(0xFF10B981),
                     cardBg = cardBg,
                     borderCol = borderCol,
@@ -513,7 +670,7 @@ private fun AllMetricsPageContent(
                     modifier = Modifier.weight(1f),
                     label = "VIENTO CRUZADO",
                     value = "${abs(wind.crosswindKmh)} km/h",
-                    subValue = "Ángulo ${wind.relativeWindAngleDeg}°",
+                    subValue = "Ángulo rel. ${wind.relativeWindAngleDeg}°",
                     accentColor = Color(0xFF2DD4BF),
                     cardBg = cardBg,
                     borderCol = borderCol,
@@ -551,12 +708,20 @@ private fun AllMetricsPageContent(
     }
 }
 
+/**
+ * Real-Time 3D GPS Map Page (`2/4 • MAPA 3D`) centered on the user's real Karoo 3 GPS coordinates.
+ * Combines:
+ * 1. Native 3D Perspective Slippy-Tile Map (OSM Calles, Esri Satélite 3D, OpenTopoMap) with 54° 3D tilt,
+ *    Course-Up GPS heading rotation, live GPS breadcrumb trail colored by wind/grade, and 3D wind vector particles.
+ * 2. WebGL 3D MapLibre Engine (`🌐 WebGL 3D`) with 3D extruded buildings & vector streets.
+ */
 @Composable
 private fun RouteMapPageContent(
     metrics: CyclingMetricsSnapshot,
     wind: WindVectorReport,
     ai: AiHeuristicEvaluation,
-    mapZoom: Float,
+    diag: LiveSensorDiagnostics,
+    mapZoomLevel: Int,
     onZoomIn: () -> Unit,
     onZoomOut: () -> Unit,
     mapWindColorMode: Boolean,
@@ -564,46 +729,67 @@ private fun RouteMapPageContent(
     showClimber: Boolean,
     onToggleClimber: () -> Unit,
     daylightMode: Boolean,
+    tileRefreshTick: Int,
+    elapsedRideSec: Int,
     cardBg: Color,
     borderCol: Color
 ) {
+    var is3DView by remember { mutableStateOf(true) }
+    var courseUpRotation by remember { mutableStateOf(true) }
+    var tileStyleIndex by remember { mutableIntStateOf(0) } // 0 = OSM Calles, 1 = Satélite 3D, 2 = Topo
+    var useWebGl3D by remember { mutableStateOf(false) }
+
+    val latStr = String.format(Locale.US, "%.5f", diag.latitude)
+    val lonStr = String.format(Locale.US, "%.5f", diag.longitude)
+    val tileStyleNames = listOf("🗺️ Calles", "🛰️ Satélite", "⛰️ Topo")
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(6.dp),
         verticalArrangement = Arrangement.spacedBy(5.dp)
     ) {
+        // LIVE REAL GPS COORDINATES & WIND NAVIGATION HEADER
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(Color(0xFF0B1220), RoundedCornerShape(10.dp))
                 .border(2.dp, Color(0xFFFACC15), RoundedCornerShape(10.dp))
-                .padding(8.dp),
+                .padding(horizontal = 8.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column {
                 Text(
-                    text = "↱ 340 m  •  Carr. 2 Presa de la Amistad",
+                    text = "📍 GPS REAL: $latStr°, $lonStr°",
                     color = Color(0xFFFACC15),
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.Black
                 )
                 Text(
-                    text = "Viento: ${wind.headwindKmh} km/h (${wind.relativeWindAngleDeg}°) • ${if (wind.aeroPowerImpactWatts >= 0) "+" else ""}${wind.aeroPowerImpactWatts}W",
+                    text = "Rumbo ${wind.riderHeadingDeg}° • Viento ${abs(wind.headwindKmh)} km/h (${if (wind.aeroPowerImpactWatts >= 0) "+" else ""}${wind.aeroPowerImpactWatts}W)",
                     color = Color(0xFF2DD4BF),
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold
                 )
             }
-            Text(
-                text = "18.8 km",
-                color = Color(0xFF10B981),
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Black
-            )
+            Column(horizontalAlignment = Alignment.End) {
+                Text(
+                    text = "${metrics.speedKmh} km/h",
+                    color = Color(0xFF10B981),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Black
+                )
+                Text(
+                    text = "Z$mapZoomLevel • ${if (is3DView) "3D 54°" else "2D"}",
+                    color = Color(0xFF93C5FD),
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
         }
 
+        // MAP 3D CONTROLS & LAYER TOOLBAR
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -612,26 +798,29 @@ private fun RouteMapPageContent(
                 modifier = Modifier
                     .background(Color(0xFF1E293B), RoundedCornerShape(6.dp))
                     .clickable { onZoomIn() }
-                    .padding(horizontal = 12.dp, vertical = 5.dp)
+                    .padding(horizontal = 9.dp, vertical = 5.dp)
             ) {
-                Text("Zoom +", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
+                Text("Z+", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
             }
             Box(
                 modifier = Modifier
                     .background(Color(0xFF1E293B), RoundedCornerShape(6.dp))
                     .clickable { onZoomOut() }
-                    .padding(horizontal = 12.dp, vertical = 5.dp)
+                    .padding(horizontal = 9.dp, vertical = 5.dp)
             ) {
-                Text("Zoom −", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
+                Text("Z−", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
             }
             Box(
                 modifier = Modifier
-                    .background(Color(0xFF0F766E), RoundedCornerShape(6.dp))
-                    .clickable { onToggleColorMode() }
-                    .padding(horizontal = 10.dp, vertical = 5.dp)
+                    .background(
+                        if (is3DView) Color(0xFF2563EB) else Color(0xFF1E293B),
+                        RoundedCornerShape(6.dp)
+                    )
+                    .clickable { is3DView = !is3DView }
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
             ) {
                 Text(
-                    text = if (mapWindColorMode) "Color: Viento" else "Color: Pendiente",
+                    text = if (is3DView) "📐 3D ON" else "📐 2D",
                     color = Color.White,
                     fontSize = 10.sp,
                     fontWeight = FontWeight.ExtraBold
@@ -639,78 +828,292 @@ private fun RouteMapPageContent(
             }
             Box(
                 modifier = Modifier
-                    .background(Color(0xFF1E293B), RoundedCornerShape(6.dp))
-                    .clickable { onToggleClimber() }
-                    .padding(horizontal = 10.dp, vertical = 5.dp)
+                    .background(Color(0xFF0F766E), RoundedCornerShape(6.dp))
+                    .clickable { tileStyleIndex = (tileStyleIndex + 1) % 3 }
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
             ) {
-                Text("⛰️ Climber", color = Color(0xFFFACC15), fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
+                Text(
+                    text = tileStyleNames[tileStyleIndex],
+                    color = Color.White,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .background(
+                        if (courseUpRotation) Color(0xFF7C3AED) else Color(0xFF1E293B),
+                        RoundedCornerShape(6.dp)
+                    )
+                    .clickable { courseUpRotation = !courseUpRotation }
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
+            ) {
+                Text(
+                    text = if (courseUpRotation) "🧭 Rumbo" else "⬆️ Norte",
+                    color = Color.White,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .background(
+                        if (useWebGl3D) Color(0xFFD97706) else Color(0xFF1E293B),
+                        RoundedCornerShape(6.dp)
+                    )
+                    .clickable { useWebGl3D = !useWebGl3D }
+                    .padding(horizontal = 7.dp, vertical = 5.dp)
+            ) {
+                Text(
+                    text = if (useWebGl3D) "🌐 WebGL" else "⚡ Nativo",
+                    color = Color(0xFFFACC15),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
             }
         }
 
+        // MAIN REAL-TIME 3D VIEWPORT
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-                .background(if (daylightMode) Color(0xFFE2E8F0) else Color(0xFF070D17), RoundedCornerShape(10.dp))
+                .background(if (daylightMode) Color(0xFFCBD5E1) else Color(0xFF050A14), RoundedCornerShape(10.dp))
                 .border(1.dp, borderCol, RoundedCornerShape(10.dp))
+                .clipToBounds()
         ) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                val w = size.width
-                val h = size.height
-
-                val step = (40f * mapZoom).coerceAtLeast(20f)
-                var x = 0f
-                while (x < w) {
-                    drawLine(Color(0x2264748B), Offset(x, 0f), Offset(x, h))
-                    x += step
-                }
-                var y = 0f
-                while (y < h) {
-                    drawLine(Color(0x2264748B), Offset(0f, y), Offset(w, y))
-                    y += step
-                }
-
-                val rawPts = listOf(
-                    0.20f to 0.84f,
-                    0.30f to 0.70f,
-                    0.45f to 0.60f,
-                    0.60f to 0.46f,
-                    0.70f to 0.30f,
-                    0.56f to 0.18f,
-                    0.35f to 0.24f,
-                    0.22f to 0.46f,
-                    0.20f to 0.84f
+            if (useWebGl3D) {
+                MapLibreWebGl3DView(
+                    lat = diag.latitude,
+                    lon = diag.longitude,
+                    bearingDeg = if (courseUpRotation) wind.riderHeadingDeg else 0,
+                    zoom = mapZoomLevel,
+                    pitchDeg = if (is3DView) 62 else 0,
+                    trackPoints = diag.trackPoints
                 )
-                val pts = rawPts.map { (rx, ry) ->
-                    Offset(
-                        w * 0.5f + (rx - 0.5f) * w * mapZoom,
-                        h * 0.5f + (ry - 0.5f) * h * mapZoom
+            } else {
+                // NATIVE 3D PERSPECTIVE SLIPPY-TILE & TERRAIN RADAR SURFACE
+                val n = (1 shl mapZoomLevel).toDouble()
+                val safeLat = diag.latitude.coerceIn(-85.0, 85.0)
+                val latRad = safeLat * PI / 180.0
+                val exactTileX = (diag.longitude + 180.0) / 360.0 * n
+                val exactTileY = (1.0 - ln(tan(latRad) + 1.0 / cos(latRad)) / PI) / 2.0 * n
+                val centerTileX = floor(exactTileX).toInt()
+                val centerTileY = floor(exactTileY).toInt()
+                val offsetPxX = ((exactTileX - centerTileX) * 256.0).toFloat()
+                val offsetPxY = ((exactTileY - centerTileY) * 256.0).toFloat()
+                val mapRotationDeg = if (courseUpRotation) -wind.riderHeadingDeg.toFloat() else 0f
+
+                Canvas(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            rotationX = if (is3DView) 54f else 0f
+                            scaleX = if (is3DView) 1.35f else 1.02f
+                            scaleY = if (is3DView) 1.35f else 1.02f
+                            cameraDistance = 15f * density
+                        }
+                ) {
+                    // Read tileRefreshTick so Compose invalidates Canvas whenever a new tile downloads
+                    val ignoredTick = tileRefreshTick
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+
+                    rotate(degrees = mapRotationDeg, pivot = Offset(cx, cy)) {
+                        val baseLeft = cx - offsetPxX
+                        val baseTop = cy - offsetPxY
+
+                        // 1. Draw Real Downloaded 256x256 Map Tiles around Rider's Real Coordinates
+                        for (dy in -2..2) {
+                            for (dx in -2..2) {
+                                val tileLeft = baseLeft + dx * 256f
+                                val tileTop = baseTop + dy * 256f
+                                val bmp = LiveTileMapEngine.getOrFetchTile(
+                                    styleIndex = tileStyleIndex,
+                                    z = mapZoomLevel,
+                                    x = centerTileX + dx,
+                                    y = centerTileY + dy
+                                )
+                                if (bmp != null) {
+                                    drawImage(
+                                        image = bmp,
+                                        topLeft = Offset(tileLeft, tileTop)
+                                    )
+                                } else {
+                                    // Dynamic 3D Coordinate Terrain Grid while tile downloads or when offline
+                                    val step = 64f
+                                    for (gx in 0..3) {
+                                        val lx = tileLeft + gx * step
+                                        drawLine(
+                                            color = Color(0x3338BDF8),
+                                            start = Offset(lx, tileTop),
+                                            end = Offset(lx, tileTop + 256f),
+                                            strokeWidth = 1.2f
+                                        )
+                                    }
+                                    for (gy in 0..3) {
+                                        val ly = tileTop + gy * step
+                                        drawLine(
+                                            color = Color(0x3338BDF8),
+                                            start = Offset(tileLeft, ly),
+                                            end = Offset(tileLeft + 256f, ly),
+                                            strokeWidth = 1.2f
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // 2. Draw Real-Time 3D Wind Streamlines across the Map
+                        val windRad = (wind.trueWindDirectionDeg + 180) * PI / 180.0
+                        val windDx = sin(windRad).toFloat()
+                        val windDy = -cos(windRad).toFloat()
+                        val phase = ((elapsedRideSec % 10) / 10f) * 80f
+                        for (row in -2..2) {
+                            for (col in -2..2) {
+                                val sx = cx + col * 110f + windDx * phase
+                                val sy = cy + row * 110f + windDy * phase
+                                drawLine(
+                                    color = Color(0x662DD4BF),
+                                    start = Offset(sx, sy),
+                                    end = Offset(sx + windDx * 28f, sy + windDy * 28f),
+                                    strokeWidth = 2.5f
+                                )
+                            }
+                        }
+
+                        // 3. Draw Real Recorded GPS Breadcrumb Trail in 3D Perspective
+                        val pts = diag.trackPoints
+                        if (pts.size >= 2) {
+                            for (i in 0 until pts.size - 1) {
+                                val p1 = pts[i]
+                                val p2 = pts[i + 1]
+                                val p1LatRad = p1.lat.coerceIn(-85.0, 85.0) * PI / 180.0
+                                val p2LatRad = p2.lat.coerceIn(-85.0, 85.0) * PI / 180.0
+
+                                val p1Tx = (p1.lon + 180.0) / 360.0 * n
+                                val p1Ty = (1.0 - ln(tan(p1LatRad) + 1.0 / cos(p1LatRad)) / PI) / 2.0 * n
+                                val p2Tx = (p2.lon + 180.0) / 360.0 * n
+                                val p2Ty = (1.0 - ln(tan(p2LatRad) + 1.0 / cos(p2LatRad)) / PI) / 2.0 * n
+
+                                val x1 = cx + ((p1Tx - exactTileX) * 256.0).toFloat()
+                                val y1 = cy + ((p1Ty - exactTileY) * 256.0).toFloat()
+                                val x2 = cx + ((p2Tx - exactTileX) * 256.0).toFloat()
+                                val y2 = cy + ((p2Ty - exactTileY) * 256.0).toFloat()
+
+                                // 3D Ground Casing Shadow
+                                drawLine(
+                                    color = Color(0xAA020617),
+                                    start = Offset(x1, y1 + 4f),
+                                    end = Offset(x2, y2 + 4f),
+                                    strokeWidth = 12f
+                                )
+
+                                val segColor = if (mapWindColorMode) {
+                                    when {
+                                        p2.headwindKmh >= 8.0 -> Color(0xFFF97316) // Headwind (Orange)
+                                        p2.headwindKmh <= -5.0 -> Color(0xFF10B981) // Tailwind (Emerald)
+                                        else -> Color(0xFF38BDF8) // Crosswind (Sky)
+                                    }
+                                } else {
+                                    when {
+                                        p2.gradePct >= 4.0 -> Color(0xFFEF4444)
+                                        p2.gradePct >= 1.5 -> Color(0xFFFACC15)
+                                        else -> Color(0xFF10B981)
+                                    }
+                                }
+
+                                drawLine(
+                                    color = segColor,
+                                    start = Offset(x1, y1),
+                                    end = Offset(x2, y2),
+                                    strokeWidth = 7f
+                                )
+                            }
+                        }
+
+                        // 4. 3D Compass & Distance Ring around Real Rider Coordinates
+                        drawCircle(
+                            color = Color(0x4438BDF8),
+                            radius = 75f,
+                            center = Offset(cx, cy),
+                            style = Stroke(width = 2f)
+                        )
+                        drawCircle(
+                            color = Color(0x33FACC15),
+                            radius = 30f,
+                            center = Offset(cx, cy)
+                        )
+                    }
+
+                    // 5. 3D Volumetric Cyclist Chevron & Forward Heading Cone (Always at Center)
+                    val chevronRotation = if (courseUpRotation) 0f else wind.riderHeadingDeg.toFloat()
+                    rotate(degrees = chevronRotation, pivot = Offset(cx, cy)) {
+                        // Forward 3D Radar Cone
+                        val conePath = Path().apply {
+                            moveTo(cx, cy)
+                            lineTo(cx - 34f, cy - 85f)
+                            lineTo(cx + 34f, cy - 85f)
+                            close()
+                        }
+                        drawPath(conePath, Color(0x28FACC15))
+
+                        // 3D Drop Shadow under Chevron
+                        val shadowPath = Path().apply {
+                            moveTo(cx, cy - 12f)
+                            lineTo(cx + 14f, cy + 18f)
+                            lineTo(cx, cy + 10f)
+                            lineTo(cx - 14f, cy + 18f)
+                            close()
+                        }
+                        drawPath(shadowPath, Color(0xAA000000))
+
+                        // 3D Extruded Navigation Chevron
+                        val chevronPath = Path().apply {
+                            moveTo(cx, cy - 18f)
+                            lineTo(cx + 14f, cy + 12f)
+                            lineTo(cx, cy + 4f)
+                            lineTo(cx - 14f, cy + 12f)
+                            close()
+                        }
+                        drawPath(chevronPath, Color(0xFFFACC15))
+                        drawPath(chevronPath, Color(0xFF0F172A), style = Stroke(width = 2.5f))
+                    }
+                }
+            }
+
+            // FLOATING 3D HORIZON SKY GRADIENT & OVERLAY BADGES
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .align(Alignment.TopCenter)
+                    .background(Color(0x99080C12))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Puntos GPS: ${diag.trackPoints.size} • Tiles: ${LiveTileMapEngine.cachedCount()}",
+                    color = Color(0xFFCBD5E1),
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        text = if (mapWindColorMode) "🎨 Ruta: Viento" else "🎨 Ruta: Pendiente",
+                        color = Color(0xFF2DD4BF),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        modifier = Modifier.clickable { onToggleColorMode() }
+                    )
+                    Text(
+                        text = if (showClimber) "⛰️ Ocultar Climber" else "⛰️ Ver Climber",
+                        color = Color(0xFFFACC15),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        modifier = Modifier.clickable { onToggleClimber() }
                     )
                 }
-
-                val routePath = Path().apply {
-                    pts.forEachIndexed { i, pt ->
-                        if (i == 0) moveTo(pt.x, pt.y) else lineTo(pt.x, pt.y)
-                    }
-                }
-                drawPath(routePath, Color(0xFF020617), style = Stroke(width = 14f))
-
-                for (i in 0 until pts.size - 1) {
-                    val segColor = if (mapWindColorMode) {
-                        when (i % 3) {
-                            0 -> Color(0xFFF97316)
-                            1 -> Color(0xFF38BDF8)
-                            else -> Color(0xFF10B981)
-                        }
-                    } else {
-                        if (i % 2 == 0) Color(0xFFFACC15) else Color(0xFFF97316)
-                    }
-                    drawLine(segColor, pts[i], pts[i + 1], strokeWidth = 8f)
-                }
-
-                val riderPt = pts[3]
-                drawCircle(Color(0x44FACC15), radius = 24f, center = riderPt)
-                drawCircle(Color(0xFFFACC15), radius = 9f, center = riderPt)
             }
         }
 
@@ -727,7 +1130,7 @@ private fun RouteMapPageContent(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "⛰️ CLIMBER • PENDIENTE ${metrics.gradePercent}%",
+                        text = "⛰️ CLIMBER • PENDIENTE REAL ${metrics.gradePercent}% • ALT ${diag.altitudeMeters.toInt()}m",
                         color = Color(0xFFFACC15),
                         fontSize = 10.sp,
                         fontWeight = FontWeight.ExtraBold
@@ -739,13 +1142,25 @@ private fun RouteMapPageContent(
                         fontWeight = FontWeight.ExtraBold
                     )
                 }
-                Canvas(modifier = Modifier.fillMaxWidth().height(24.dp)) {
+                Canvas(modifier = Modifier.fillMaxWidth().height(22.dp)) {
                     val w = size.width
                     val h = size.height
-                    drawLine(Color(0xFFFACC15), Offset(0f, h * 0.85f), Offset(w * 0.35f, h * 0.55f), strokeWidth = 3f)
-                    drawLine(Color(0xFFFACC15), Offset(w * 0.35f, h * 0.55f), Offset(w * 0.7f, h * 0.25f), strokeWidth = 3f)
-                    drawLine(Color(0xFFFACC15), Offset(w * 0.7f, h * 0.25f), Offset(w, h * 0.15f), strokeWidth = 3f)
-                    drawCircle(Color(0xFF38BDF8), radius = 5f, center = Offset(w * 0.45f, h * 0.45f))
+                    val pts = diag.trackPoints
+                    if (pts.size >= 2) {
+                        val minAlt = pts.minOf { it.altitudeMeters }
+                        val maxAlt = (pts.maxOf { it.altitudeMeters }).coerceAtLeast(minAlt + 5.0)
+                        for (i in 0 until pts.size - 1) {
+                            val x1 = (i.toFloat() / (pts.size - 1).coerceAtLeast(1)) * w
+                            val x2 = ((i + 1).toFloat() / (pts.size - 1).coerceAtLeast(1)) * w
+                            val y1 = h - (((pts[i].altitudeMeters - minAlt) / (maxAlt - minAlt)).toFloat() * (h * 0.8f) + h * 0.1f)
+                            val y2 = h - (((pts[i + 1].altitudeMeters - minAlt) / (maxAlt - minAlt)).toFloat() * (h * 0.8f) + h * 0.1f)
+                            drawLine(Color(0xFFFACC15), Offset(x1, y1), Offset(x2, y2), strokeWidth = 3f)
+                        }
+                        drawCircle(Color(0xFF38BDF8), radius = 4.5f, center = Offset(w - 4f, h * 0.45f))
+                    } else {
+                        drawLine(Color(0xFFFACC15), Offset(0f, h * 0.7f), Offset(w, h * 0.5f), strokeWidth = 3f)
+                        drawCircle(Color(0xFF38BDF8), radius = 4.5f, center = Offset(w * 0.5f, h * 0.6f))
+                    }
                 }
             }
         }
@@ -766,9 +1181,9 @@ private fun RouteMapPageContent(
             )
             MetricTile(
                 modifier = Modifier.weight(1f),
-                label = "SPEED",
+                label = "SPEED / DIST",
                 value = "${metrics.speedKmh}",
-                subValue = "km/h",
+                subValue = "${metrics.distanceKm} km",
                 accentColor = Color(0xFF10B981),
                 cardBg = cardBg,
                 borderCol = borderCol,
@@ -788,9 +1203,119 @@ private fun RouteMapPageContent(
     }
 }
 
+/**
+ * Embedded MapLibre GL JS 3D WebGL View (`🌐 WebGL`) with 62° 3D camera pitch,
+ * 3D extruded buildings (`OpenFreeMap Liberty`), and real-time GPS coordinate tracking.
+ */
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+private fun MapLibreWebGl3DView(
+    lat: Double,
+    lon: Double,
+    bearingDeg: Int,
+    zoom: Int,
+    pitchDeg: Int,
+    trackPoints: List<io.hammerhead.karooaipro.extension.GpsTrackPoint>
+) {
+    val htmlTemplate = remember {
+        """
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+          <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+          <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+          <style>
+            html, body, #map { margin: 0; padding: 0; width: 100%; height: 100%; background: #070d17; overflow: hidden; }
+            .rider-marker {
+              width: 22px; height: 22px; border-radius: 50%;
+              background: #facc15; border: 3px solid #0f172a;
+              box-shadow: 0 0 16px rgba(250, 204, 21, 0.95);
+            }
+          </style>
+        </head>
+        <body>
+          <div id="map"></div>
+          <script>
+            let mapReady = false;
+            const map = new maplibregl.Map({
+              container: 'map',
+              style: 'https://tiles.openfreemap.org/styles/liberty',
+              center: [$lon, $lat],
+              zoom: $zoom,
+              pitch: $pitchDeg,
+              bearing: $bearingDeg,
+              attributionControl: false
+            });
+            const el = document.createElement('div');
+            el.className = 'rider-marker';
+            const marker = new maplibregl.Marker({ element: el }).setLngLat([$lon, $lat]).addTo(map);
+
+            map.on('load', () => {
+              mapReady = true;
+              map.addSource('rider-track', {
+                type: 'geojson',
+                data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [[$lon, $lat]] } }
+              });
+              map.addLayer({
+                id: 'rider-track-line',
+                type: 'line',
+                source: 'rider-track',
+                paint: { 'line-color': '#10b981', 'line-width': 6 }
+              });
+            });
+
+            window.updateKaroo3DMap = function(newLat, newLon, newBearing, newZoom, newPitch, coordsJson) {
+              marker.setLngLat([newLon, newLat]);
+              map.easeTo({
+                center: [newLon, newLat],
+                bearing: newBearing,
+                zoom: newZoom,
+                pitch: newPitch,
+                duration: 650
+              });
+              if (mapReady && coordsJson) {
+                const src = map.getSource('rider-track');
+                if (src) {
+                  src.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: JSON.parse(coordsJson) } });
+                }
+              }
+            };
+          </script>
+        </body>
+        </html>
+        """.trimIndent()
+    }
+
+    AndroidView(
+        modifier = Modifier.fillMaxSize(),
+        factory = { context ->
+            WebView(context).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.databaseEnabled = true
+                webChromeClient = WebChromeClient()
+                webViewClient = WebViewClient()
+                loadDataWithBaseURL("https://tiles.openfreemap.org/", htmlTemplate, "text/html", "UTF-8", null)
+            }
+        },
+        update = { webView ->
+            val coordsJson = if (trackPoints.size >= 2) {
+                trackPoints.takeLast(120).joinToString(prefix = "[", postfix = "]") { "[${it.lon},${it.lat}]" }
+            } else {
+                "[[$lon,$lat]]"
+            }
+            val js = "if(window.updateKaroo3DMap){window.updateKaroo3DMap($lat,$lon,$bearingDeg,$zoom,$pitchDeg,'$coordsJson');}"
+            webView.evaluateJavascript(js, null)
+        }
+    )
+}
+
 @Composable
 private fun WindRadarPageContent(
     wind: WindVectorReport,
+    diag: LiveSensorDiagnostics,
     cardBg: Color,
     borderCol: Color,
     primaryText: Color,
@@ -813,9 +1338,9 @@ private fun WindRadarPageContent(
 
         Box(
             modifier = Modifier
-                .size(170.dp)
-                .background(cardBg, RoundedCornerShape(85.dp))
-                .border(2.dp, Color(0xFF14B8A6), RoundedCornerShape(85.dp)),
+                .size(160.dp)
+                .background(cardBg, RoundedCornerShape(80.dp))
+                .border(2.dp, Color(0xFF14B8A6), RoundedCornerShape(80.dp)),
             contentAlignment = Alignment.Center
         ) {
             Canvas(modifier = Modifier.fillMaxSize()) {
@@ -831,9 +1356,9 @@ private fun WindRadarPageContent(
                 drawCircle(Color(0xFFFACC15), radius = 7f, center = Offset(cx, cy))
             }
             Text(
-                text = "${wind.relativeWindAngleDeg}°",
+                text = "Rel: ${wind.relativeWindAngleDeg}°",
                 color = primaryText,
-                fontSize = 16.sp,
+                fontSize = 14.sp,
                 fontWeight = FontWeight.Black,
                 modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)
             )
@@ -871,9 +1396,9 @@ private fun WindRadarPageContent(
         ) {
             MetricTile(
                 modifier = Modifier.weight(1f),
-                label = "TEMPERATURA",
-                value = "${wind.temperatureC}°C",
-                subValue = "Open-Meteo Live",
+                label = "ALTITUD BAROMÉTRICA",
+                value = "${diag.altitudeMeters} m",
+                subValue = "${diag.pressureHpa} hPa",
                 accentColor = Color(0xFFFACC15),
                 cardBg = cardBg,
                 borderCol = borderCol,
@@ -881,9 +1406,9 @@ private fun WindRadarPageContent(
             )
             MetricTile(
                 modifier = Modifier.weight(1f),
-                label = "HUMEDAD / LLUVIA",
-                value = "${wind.humidityPct}%",
-                subValue = "${wind.precipitationMm} mm",
+                label = "TEMP / HUMEDAD",
+                value = "${wind.temperatureC}°C",
+                subValue = "${wind.humidityPct}% RH • ${wind.precipitationMm} mm",
                 accentColor = Color(0xFF2DD4BF),
                 cardBg = cardBg,
                 borderCol = borderCol,
