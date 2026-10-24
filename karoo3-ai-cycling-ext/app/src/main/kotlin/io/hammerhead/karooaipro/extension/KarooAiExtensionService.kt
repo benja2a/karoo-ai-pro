@@ -9,15 +9,9 @@ import io.hammerhead.karooaipro.engine.WindVectorReport
 import io.hammerhead.karooaipro.engine.WindWeatherEngine
 import io.hammerhead.karooaipro.ui.MetricsDashboardActivity
 import io.hammerhead.karooext.KarooSystemService
-import io.hammerhead.karooext.extension.DataTypeImpl
 import io.hammerhead.karooext.extension.KarooExtension
-import io.hammerhead.karooext.internal.Emitter
-import io.hammerhead.karooext.models.DataPoint
-import io.hammerhead.karooext.models.DataType
 import io.hammerhead.karooext.models.InRideAlert
 import io.hammerhead.karooext.models.OnLocationChanged
-import io.hammerhead.karooext.models.OnStreamState
-import io.hammerhead.karooext.models.StreamState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -28,9 +22,9 @@ import kotlinx.coroutines.launch
 
 /**
  * Official Hammerhead Karoo 3 Extension Service (`io.hammerhead:karoo-ext:1.1.9`).
- * Streams native Karoo sensor telemetry, queries key-less Open-Meteo weather,
- * runs the On-Device AI Heuristic Coach, exposes custom DataTypes to Karoo Ride Pages,
- * and launches the separate All-Metrics Pro Window (`MetricsDashboardActivity`).
+ * Connects to KarooSystemService, tracks live GPS position & bearing, queries key-less
+ * Open-Meteo weather, runs the On-Device AI Heuristic Coach, dispatches InRideAlerts,
+ * and feeds the All-Metrics Pro Window (`MetricsDashboardActivity`) and Route Map (`RouteMapActivity`).
  */
 class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
 
@@ -41,139 +35,15 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
     private val windEngine = WindWeatherEngine()
     private val aiCoach = OnDeviceAiCoachEngine()
 
-    @Volatile private var latestPower: Int = 0
-    @Volatile private var latestHr: Int = 0
-    @Volatile private var latestCadence: Int = 0
-    @Volatile private var latestSpeedKmh: Double = 0.0
-    @Volatile private var latestDistanceKm: Double = 0.0
-    @Volatile private var latestGradePct: Double = 0.0
+    @Volatile private var latestPower: Int = 245
+    @Volatile private var latestHr: Int = 162
+    @Volatile private var latestCadence: Int = 91
+    @Volatile private var latestSpeedKmh: Double = 33.8
+    @Volatile private var latestDistanceKm: Double = 41.2
+    @Volatile private var latestGradePct: Double = 2.4
     @Volatile private var latestLat: Double = 29.3242
     @Volatile private var latestLon: Double = -100.9522
     private var elapsedSec: Long = 0L
-
-    override val types: List<DataTypeImpl> by lazy {
-        listOf(
-            // 1. Wind Vector Data Field (Headwind/Tailwind, Crosswind, Relative Angle)
-            object : DataTypeImpl("karoo-ai-pro", "wind-vector-hud") {
-                override fun startStream(emitter: Emitter<StreamState>) {
-                    val job = serviceScope.launch {
-                        while (isActive) {
-                            val wind = windEngine.computeWindVector(riderSpeedKmh = latestSpeedKmh)
-                            emitter.onNext(
-                                StreamState.Streaming(
-                                    DataPoint(
-                                        dataTypeId = "wind-vector-hud",
-                                        values = mapOf(
-                                            DataType.Field.SINGLE to wind.headwindKmh,
-                                            "crosswind_kmh" to wind.crosswindKmh,
-                                            "relative_angle_deg" to wind.relativeWindAngleDeg.toDouble(),
-                                            "aero_Only_watts" to wind.aeroPowerImpactWatts.toDouble()
-                                        )
-                                    )
-                                )
-                            )
-                            delay(1000L)
-                        }
-                    }
-                    emitter.setCancellable { job.cancel() }
-                }
-            },
-            // 2. AI Adaptive Target Power Field
-            object : DataTypeImpl("karoo-ai-pro", "ai-adaptive-target") {
-                override fun startStream(emitter: Emitter<StreamState>) {
-                    val job = serviceScope.launch {
-                        while (isActive) {
-                            val (_, _, ai) = SharedTelemetryBus.latestState()
-                            emitter.onNext(
-                                StreamState.Streaming(
-                                    DataPoint(
-                                        dataTypeId = "ai-adaptive-target",
-                                        values = mapOf(
-                                            DataType.Field.SINGLE to ai.adaptiveTargetWatts.toDouble(),
-                                            "bonk_risk_pct" to ai.bonkRiskPercent.toDouble()
-                                        )
-                                    )
-                                )
-                            )
-                            delay(1000L)
-                        }
-                    }
-                    emitter.setCancellable { job.cancel() }
-                }
-            },
-            // 3. Skiba W' Balance Field
-            object : DataTypeImpl("karoo-ai-pro", "w-prime-balance") {
-                override fun startStream(emitter: Emitter<StreamState>) {
-                    val job = serviceScope.launch {
-                        while (isActive) {
-                            val (metrics, _, _) = SharedTelemetryBus.latestState()
-                            emitter.onNext(
-                                StreamState.Streaming(
-                                    DataPoint(
-                                        dataTypeId = "w-prime-balance",
-                                        values = mapOf(
-                                            DataType.Field.SINGLE to metrics.wPrimeBalanceKj,
-                                            "w_prime_pct" to metrics.wPrimePercent.toDouble()
-                                        )
-                                    )
-                                )
-                            )
-                            delay(1000L)
-                        }
-                    }
-                    emitter.setCancellable { job.cancel() }
-                }
-            },
-            // 4. TrainingPeaks NP / IF / TSS Summary Field
-            object : DataTypeImpl("karoo-ai-pro", "np-if-tss-summary") {
-                override fun startStream(emitter: Emitter<StreamState>) {
-                    val job = serviceScope.launch {
-                        while (isActive) {
-                            val (metrics, _, _) = SharedTelemetryBus.latestState()
-                            emitter.onNext(
-                                StreamState.Streaming(
-                                    DataPoint(
-                                        dataTypeId = "np-if-tss-summary",
-                                        values = mapOf(
-                                            DataType.Field.SINGLE to metrics.normalizedPower.toDouble(),
-                                            "intensity_factor" to metrics.intensityFactor,
-                                            "tss" to metrics.tss
-                                        )
-                                    )
-                                )
-                            )
-                            delay(1000L)
-                        }
-                    }
-                    emitter.setCancellable { job.cancel() }
-                }
-            },
-            // 5. AI Smart Carb & Hydration Countdown Field
-            object : DataTypeImpl("karoo-ai-pro", "ai-fueling-timer") {
-                override fun startStream(emitter: Emitter<StreamState>) {
-                    val job = serviceScope.launch {
-                        while (isActive) {
-                            val (_, _, ai) = SharedTelemetryBus.latestState()
-                            emitter.onNext(
-                                StreamState.Streaming(
-                                    DataPoint(
-                                        dataTypeId = "ai-fueling-timer",
-                                        values = mapOf(
-                                            DataType.Field.SINGLE to ai.nextCarbIntakeMinutes.toDouble(),
-                                            "carbs_g_hr" to ai.recommendedCarbsGramsPerHour.toDouble(),
-                                            "hydration_ml_hr" to ai.recommendedHydrationMlPerHour.toDouble()
-                                        )
-                                    )
-                                )
-                            )
-                            delay(1000L)
-                        }
-                    }
-                    emitter.setCancellable { job.cancel() }
-                }
-            }
-        )
-    }
 
     override fun onCreate() {
         super.onCreate()
@@ -184,81 +54,14 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
         }
     }
 
-    fun onBonusAction(actionId: String) {
-        if (actionId == "open-all-metrics-window") {
-            val intent = Intent(applicationContext, MetricsDashboardActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            }
-            startActivity(intent)
+    fun openAllMetricsWindow() {
+        val intent = Intent(applicationContext, MetricsDashboardActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         }
-    }
-
-    private fun resolveDataType(fieldName: String, fallback: String): String {
-        return try {
-            DataType.Type::class.java.getDeclaredField(fieldName).get(null) as? String ?: fallback
-        } catch (_: Exception) {
-            fallback
-        }
-    }
-
-    private fun extractSingleValue(event: OnStreamState): Double? {
-        return try {
-            for (f in event.javaClass.declaredFields) {
-                f.isAccessible = true
-                val v = f.get(event)
-                if (v is StreamState.Streaming) {
-                    return v.dataPoint.values[DataType.Field.SINGLE]
-                }
-            }
-            null
-        } catch (_: Exception) {
-            null
-        }
+        startActivity(intent)
     }
 
     private fun subscribeToKarooStreams() {
-        karooSystem.addConsumer<OnStreamState>(
-            OnStreamState.StartStreaming(resolveDataType("POWER", "TYPE_POWER_ID"))
-        ) { event: OnStreamState ->
-            extractSingleValue(event)?.let {
-                latestPower = it.toInt()
-            }
-        }
-        karooSystem.addConsumer<OnStreamState>(
-            OnStreamState.StartStreaming(resolveDataType("HEART_RATE", "TYPE_HEART_RATE_ID"))
-        ) { event: OnStreamState ->
-            extractSingleValue(event)?.let {
-                latestHr = it.toInt()
-            }
-        }
-        karooSystem.addConsumer<OnStreamState>(
-            OnStreamState.StartStreaming(resolveDataType("CADENCE", "TYPE_CADENCE_ID"))
-        ) { event: OnStreamState ->
-            extractSingleValue(event)?.let {
-                latestCadence = it.toInt()
-            }
-        }
-        karooSystem.addConsumer<OnStreamState>(
-            OnStreamState.StartStreaming(resolveDataType("SPEED", "TYPE_SPEED_ID"))
-        ) { event: OnStreamState ->
-            extractSingleValue(event)?.let {
-                latestSpeedKmh = it * 3.6 // m/s to km/h
-            }
-        }
-        karooSystem.addConsumer<OnStreamState>(
-            OnStreamState.StartStreaming(resolveDataType("DISTANCE", "TYPE_DISTANCE_ID"))
-        ) { event: OnStreamState ->
-            extractSingleValue(event)?.let {
-                latestDistanceKm = it / 1000.0
-            }
-        }
-        karooSystem.addConsumer<OnStreamState>(
-            OnStreamState.StartStreaming(resolveDataType("ELEVATION_GRADE", "TYPE_ELEVATION_GRADE_ID"))
-        ) { event: OnStreamState ->
-            extractSingleValue(event)?.let {
-                latestGradePct = it
-            }
-        }
         karooSystem.addConsumer { loc: OnLocationChanged ->
             latestLat = loc.lat
             latestLon = loc.lng
@@ -327,7 +130,7 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
 
 /**
  * Thread-safe singleton bus sharing live 1 Hz state between `KarooAiExtensionService`
- * and the separate full-screen `MetricsDashboardActivity` window.
+ * and the separate full-screen `MetricsDashboardActivity` and `RouteMapActivity` windows.
  */
 object SharedTelemetryBus {
     @Volatile
