@@ -149,15 +149,10 @@ class MetricsDashboardActivity : ComponentActivity() {
         }
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 1001) {
-            SharedTelemetryBus.startInternalHardwareSensors(applicationContext)
-        }
+    override fun onResume() {
+        super.onResume()
+        // Automatically starts internal GPS & Barometer as soon as the permission dialog closes
+        SharedTelemetryBus.startInternalHardwareSensors(applicationContext)
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
