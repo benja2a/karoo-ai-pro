@@ -142,7 +142,7 @@ fun KarooMultiPageCockpit(
                 val mins = (74 + tickCount / 60)
                 val secs = (tickCount % 60).toString().padStart(2, '0')
                 Text(
-                    text = "01:${(mins \% 60).toString().padStart(2, '0')}:$secs  •  GPS 3D",
+                    text = "01:${(mins % 60).toString().padStart(2, '0')}:$secs  •  GPS 3D",
                     color = Color(0xFFFACC15),
                     fontSize = 11.sp,
                     fontWeight = FontWeight.ExtraBold
@@ -411,7 +411,7 @@ private fun AllMetricsPageContent(
                     modifier = Modifier.weight(1f),
                     label = "3S POWER (${metrics.powerZoneName})",
                     value = "${metrics.power3s}W",
-                    subValue = "${metrics.ftpPercent}\% FTP • Tgt ${ai.adaptiveTargetWatts}W",
+                    subValue = "${metrics.ftpPercent}% FTP • Tgt ${ai.adaptiveTargetWatts}W",
                     accentColor = Color(0xFFFACC15),
                     cardBg = cardBg,
                     borderCol = borderCol,
@@ -487,7 +487,7 @@ private fun AllMetricsPageContent(
                     modifier = Modifier.weight(1f),
                     label = "PULSO / CADENCIA",
                     value = "${metrics.heartRateBpm} bpm",
-                    subValue = "Z${metrics.hrZone} •${metrics.cadenceRpm} rpm",
+                    subValue = "Z${metrics.hrZone} • ${metrics.cadenceRpm} rpm",
                     accentColor = Color(0xFFF43F5E),
                     cardBg = cardBg,
                     borderCol = borderCol,
@@ -708,4 +708,352 @@ private fun RouteMapPageContent(
 
                 val routePath = Path().apply {
                     pts.forEachIndexed { i, pt ->
-                        if (i
+                        if (i == 0) moveTo(pt.x, pt.y) else lineTo(pt.x, pt.y)
+                    }
+                }
+                drawPath(routePath, Color(0xFF020617), style = Stroke(width = 14f))
+
+                for (i in 0 until pts.size - 1) {
+                    val segColor = if (mapWindColorMode) {
+                        when (i % 3) {
+                            0 -> Color(0xFFF97316) // Headwind
+                            1 -> Color(0xFF38BDF8) // Crosswind
+                            else -> Color(0xFF10B981) // Tailwind
+                        }
+                    } else {
+                        if (i % 2 == 0) Color(0xFFFACC15) else Color(0xFFF97316)
+                    }
+                    drawLine(segColor, pts[i], pts[i + 1], strokeWidth = 8f)
+                }
+
+                // Rider live position marker
+                val riderPt = pts[3]
+                drawCircle(Color(0x44FACC15), radius = 24f, center = riderPt)
+                drawCircle(Color(0xFFFACC15), radius = 9f, center = riderPt)
+            }
+        }
+
+        // Climber Drawer
+        if (showClimber) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF0B101B), RoundedCornerShape(8.dp))
+                    .border(1.dp, borderCol, RoundedCornerShape(8.dp))
+                    .padding(6.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "⛰️ CLIMBER • PENDIENTE ${metrics.gradePercent}%",
+                        color = Color(0xFFFACC15),
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Text(
+                        text = "VAM ${metrics.vamMetersPerHour} m/h",
+                        color = Color(0xFF38BDF8),
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+                Canvas(modifier = Modifier.fillMaxWidth().height(24.dp)) {
+                    val w = size.width
+                    val h = size.height
+                    drawLine(Color(0xFFFACC15), Offset(0f, h * 0.85f), Offset(w * 0.35f, h * 0.55f), strokeWidth = 3f)
+                    drawLine(Color(0xFFFACC15), Offset(w * 0.35f, h * 0.55f), Offset(w * 0.7f, h * 0.25f), strokeWidth = 3f)
+                    drawLine(Color(0xFFFACC15), Offset(w * 0.7f, h * 0.25f), Offset(w, h * 0.15f), strokeWidth = 3f)
+                    drawCircle(Color(0xFF38BDF8), radius = 5f, center = Offset(w * 0.45f, h * 0.45f))
+                }
+            }
+        }
+
+        // Bottom 3 Glanceable Map Data Tiles
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            MetricTile(
+                modifier = Modifier.weight(1f),
+                label = "3S POWER",
+                value = "${metrics.power3s}W",
+                subValue = metrics.powerZoneName,
+                accentColor = Color(0xFFFACC15),
+                cardBg = cardBg,
+                borderCol = borderCol,
+                secondaryText = Color(0xFF94A3B8)
+            )
+            MetricTile(
+                modifier = Modifier.weight(1f),
+                label = "SPEED",
+                value = "${metrics.speedKmh}",
+                subValue = "km/h",
+                accentColor = Color(0xFF10B981),
+                cardBg = cardBg,
+                borderCol = borderCol,
+                secondaryText = Color(0xFF94A3B8)
+            )
+            MetricTile(
+                modifier = Modifier.weight(1f),
+                label = "AI TARGET",
+                value = "${ai.adaptiveTargetWatts}W",
+                subValue = "Óptimo",
+                accentColor = Color(0xFF38BDF8),
+                cardBg = cardBg,
+                borderCol = borderCol,
+                secondaryText = Color(0xFF94A3B8)
+            )
+        }
+    }
+}
+
+@Composable
+private fun WindRadarPageContent(
+    wind: WindVectorReport,
+    cardBg: Color,
+    borderCol: Color,
+    primaryText: Color,
+    secondaryText: Color
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(8.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "RADAR DE VIENTO OPEN-METEO • ${wind.windImpactLabel}",
+            color = Color(0xFF2DD4BF),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Black
+        )
+
+        // Compass Rose Canvas
+        Box(
+            modifier = Modifier
+                .size(170.dp)
+                .background(cardBg, RoundedCornerShape(85.dp))
+                .border(2.dp, Color(0xFF14B8A6), RoundedCornerShape(85.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val cx = size.width / 2f
+                val cy = size.height / 2f
+                val r = size.minDimension * 0.38f
+                drawCircle(Color(0x3314B8A6), radius = r, center = Offset(cx, cy), style = Stroke(width = 3f))
+
+                val rad = (wind.relativeWindAngleDeg - 90) * PI / 180.0
+                val tipX = cx + (r * cos(rad)).toFloat()
+                val tipY = cy + (r * sin(rad)).toFloat()
+                drawLine(Color(0xFF2DD4BF), Offset(cx, cy), Offset(tipX, tipY), strokeWidth = 6f)
+                drawCircle(Color(0xFFFACC15), radius = 7f, center = Offset(cx, cy))
+            }
+            Text(
+                text = "${wind.relativeWindAngleDeg}°",
+                color = primaryText,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Black,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            MetricTile(
+                modifier = Modifier.weight(1f),
+                label = if (wind.headwindKmh >= 0) "VIENTO FRONTAL" else "VIENTO A FAVOR",
+                value = "${abs(wind.headwindKmh)} km/h",
+                subValue = "Impacto Aero: ${if (wind.aeroPowerImpactWatts >= 0) "+" else ""}${wind.aeroPowerImpactWatts}W",
+                accentColor = Color(0xFFF97316),
+                cardBg = cardBg,
+                borderCol = borderCol,
+                secondaryText = secondaryText
+            )
+            MetricTile(
+                modifier = Modifier.weight(1f),
+                label = "VIENTO CRUZADO",
+                value = "${abs(wind.crosswindKmh)} km/h",
+                subValue = "Rachas ${wind.windGustsKmh} km/h",
+                accentColor = Color(0xFF38BDF8),
+                cardBg = cardBg,
+                borderCol = borderCol,
+                secondaryText = secondaryText
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            MetricTile(
+                modifier = Modifier.weight(1f),
+                label = "TEMPERATURA",
+                value = "${wind.temperatureC}°C",
+                subValue = "Open-Meteo Live",
+                accentColor = Color(0xFFFACC15),
+                cardBg = cardBg,
+                borderCol = borderCol,
+                secondaryText = secondaryText
+            )
+            MetricTile(
+                modifier = Modifier.weight(1f),
+                label = "HUMEDAD / LLUVIA",
+                value = "${wind.humidityPct}%",
+                subValue = "${wind.precipitationMm} mm",
+                accentColor = Color(0xFF2DD4BF),
+                cardBg = cardBg,
+                borderCol = borderCol,
+                secondaryText = secondaryText
+            )
+        }
+    }
+}
+
+@Composable
+private fun AiCoachPageContent(
+    metrics: CyclingMetricsSnapshot,
+    wind: WindVectorReport,
+    ai: AiHeuristicEvaluation,
+    carbsLogged: Int,
+    hydrationMl: Int,
+    onAddGel: () -> Unit,
+    onAddSip: () -> Unit,
+    cardBg: Color,
+    borderCol: Color,
+    primaryText: Color,
+    secondaryText: Color
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(8.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            text = "ENTRENADOR IA ON-DEVICE (100% OFFLINE)",
+            color = Color(0xFF60A5FA),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Black
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            MetricTile(
+                modifier = Modifier.weight(1f),
+                label = "POTENCIA OBJETIVO IA",
+                value = "${ai.adaptiveTargetWatts}W",
+                subValue = "Actual 3s: ${metrics.power3s}W",
+                accentColor = Color(0xFFFACC15),
+                cardBg = cardBg,
+                borderCol = borderCol,
+                secondaryText = secondaryText
+            )
+            MetricTile(
+                modifier = Modifier.weight(1f),
+                label = "RIESGO DE PÁJARA",
+                value = "${ai.bonkRiskPercent}%",
+                subValue = ai.bonkStatusLabel,
+                accentColor = Color(0xFF10B981),
+                cardBg = cardBg,
+                borderCol = borderCol,
+                secondaryText = secondaryText
+            )
+        }
+
+        // Interactive Nutrition & Hydration Buttons
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .background(cardBg, RoundedCornerShape(8.dp))
+                    .border(1.dp, borderCol, RoundedCornerShape(8.dp))
+                    .padding(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text("CARBOHIDRATOS", color = secondaryText, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                Text("${carbsLogged}g registrados", color = primaryText, fontSize = 15.sp, fontWeight = FontWeight.Black)
+                Text("Meta: ${ai.recommendedCarbsGramsPerHour}g/h", color = Color(0xFFF59E0B), fontSize = 10.sp)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFFD97706), RoundedCornerShape(6.dp))
+                        .clickable { onAddGel() }
+                        .padding(vertical = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("+25g Gel Energético", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                }
+            }
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .background(cardBg, RoundedCornerShape(8.dp))
+                    .border(1.dp, borderCol, RoundedCornerShape(8.dp))
+                    .padding(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text("HIDRATACIÓN", color = secondaryText, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                Text("${hydrationMl}ml bebidos", color = primaryText, fontSize = 15.sp, fontWeight = FontWeight.Black)
+                Text("Meta: ${ai.recommendedHydrationMlPerHour}ml/h", color = Color(0xFF38BDF8), fontSize = 10.sp)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF0284C7), RoundedCornerShape(6.dp))
+                        .clickable { onAddSip() }
+                        .padding(vertical = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("+150ml Sorbo Agua", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                }
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(cardBg, RoundedCornerShape(8.dp))
+                .border(1.dp, borderCol, RoundedCornerShape(8.dp))
+                .padding(8.dp)
+        ) {
+            Text("DIRECTIVA TÁCTICA ACTIVA", color = Color(0xFF60A5FA), fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
+            Text(ai.tacticalHeadline, color = primaryText, fontSize = 13.sp, fontWeight = FontWeight.Black)
+            Text(ai.tacticalReason, color = secondaryText, fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable
+fun MetricTile(
+    modifier: Modifier = Modifier,
+    label: String,
+    value: String,
+    subValue: String,
+    accentColor: Color,
+    cardBg: Color = Color(0xFF161F30),
+    borderCol: Color = Color(0xFF1E293B),
+    secondaryText: Color = Color(0xFF94A3B8)
+) {
+    Column(
+        modifier = modifier
+            .background(cardBg, RoundedCornerShape(8.dp))
+            .border(1.dp, borderCol, RoundedCornerShape(8.dp))
+            .padding(horizontal = 8.dp, vertical = 6.dp)
+    ) {
+        Text(text = label, color = secondaryText, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
+        Text(text = value, color = accentColor, fontSize = 20.sp, fontWeight = FontWeight.Black)
+        Text(text = subValue, color = secondaryText, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
