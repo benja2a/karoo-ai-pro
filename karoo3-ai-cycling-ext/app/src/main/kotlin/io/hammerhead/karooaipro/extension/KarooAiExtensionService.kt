@@ -36,8 +36,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.cos
 import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -251,7 +251,7 @@ object SharedTelemetryBus {
         }
     }
 
-    private fun extractSingleValue(event: Any): Double? {
+    private fun extractSingleValue(event: OnStreamState): Double? {
         return try {
             for (field in event.javaClass.declaredFields) {
                 field.isAccessible = true
@@ -263,6 +263,17 @@ object SharedTelemetryBus {
                     return dp.values.values.firstOrNull()
                 }
             }
+            for (method in event.javaClass.methods) {
+                if (method.parameterCount == 0) {
+                    val v = method.invoke(event)
+                    if (v is StreamState.Streaming) {
+                        val dp = v.dataPoint
+                        val single = dp.values[DataType.Field.SINGLE]
+                        if (single != null) return single
+                        return dp.values.values.firstOrNull()
+                    }
+                }
+            }
             null
         } catch (_: Exception) {
             null
@@ -271,49 +282,49 @@ object SharedTelemetryBus {
 
     private fun subscribeToKarooStreams(service: KarooSystemService) {
         // 1. Power Meter (ANT+ / BLE)
-        service.addConsumer(OnStreamState.StartStreaming(DataType.Type.POWER)) { event ->
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.POWER)) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestPower = it.roundToInt().coerceAtLeast(0)
                 lastKarooPowerMs = System.currentTimeMillis()
             }
         }
         // 2. Heart Rate Strap / Optical HR (ANT+ / BLE)
-        service.addConsumer(OnStreamState.StartStreaming(DataType.Type.HEART_RATE)) { event ->
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.HEART_RATE)) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestHr = it.roundToInt().coerceAtLeast(0)
                 lastKarooHrMs = System.currentTimeMillis()
             }
         }
         // 3. Cadence Sensor (ANT+ / BLE)
-        service.addConsumer(OnStreamState.StartStreaming(DataType.Type.CADENCE)) { event ->
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.CADENCE)) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestCadence = it.roundToInt().coerceAtLeast(0)
                 lastKarooCadMs = System.currentTimeMillis()
             }
         }
         // 4. Speed (Karoo fused wheel sensor / GPS in m/s -> km/h)
-        service.addConsumer(OnStreamState.StartStreaming(DataType.Type.SPEED)) { event ->
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.SPEED)) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestSpeedKmh = (it * 3.6).coerceAtLeast(0.0)
                 lastKarooSpeedMs = System.currentTimeMillis()
             }
         }
         // 5. Distance (Karoo ride distance in meters -> km)
-        service.addConsumer(OnStreamState.StartStreaming(DataType.Type.DISTANCE)) { event ->
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.DISTANCE)) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestDistanceKm = (it / 1000.0).coerceAtLeast(0.0)
                 lastKarooDistMs = System.currentTimeMillis()
             }
         }
         // 6. Elevation Grade (%)
-        service.addConsumer(OnStreamState.StartStreaming(DataType.Type.ELEVATION_GRADE)) { event ->
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.ELEVATION_GRADE)) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestGradePct = it.coerceIn(-35.0, 35.0)
                 lastKarooGradeMs = System.currentTimeMillis()
             }
         }
         // 7. Live GPS Location from Karoo System
-        service.addConsumer { loc: OnLocationChanged ->
+        service.addConsumer<OnLocationChanged> { loc: OnLocationChanged ->
             if (loc.lat != 0.0 || loc.lng != 0.0) {
                 latestLat = loc.lat
                 latestLon = loc.lng
