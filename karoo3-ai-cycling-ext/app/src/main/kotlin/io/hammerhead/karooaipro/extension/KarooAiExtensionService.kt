@@ -27,7 +27,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Official Hammerhead Karoo 3 Extension Service (`io.hammerhead:karoo-ext`).
+ * Official Hammerhead Karoo 3 Extension Service (`io.hammerhead:karoo-ext:1.1.9`).
  * Streams native Karoo sensor telemetry, queries key-less Open-Meteo weather,
  * runs the On-Device AI Heuristic Coach, exposes custom DataTypes to Karoo Ride Pages,
  * and launches the separate All-Metrics Pro Window (`MetricsDashboardActivity`).
@@ -62,7 +62,7 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
                             emitter.onNext(
                                 StreamState.Streaming(
                                     DataPoint(
-                                        dataTypeId = dataTypeId,
+                                        dataTypeId = "wind-vector-hud",
                                         values = mapOf(
                                             DataType.Field.SINGLE to wind.headwindKmh,
                                             "crosswind_kmh" to wind.crosswindKmh,
@@ -87,7 +87,7 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
                             emitter.onNext(
                                 StreamState.Streaming(
                                     DataPoint(
-                                        dataTypeId = dataTypeId,
+                                        dataTypeId = "ai-adaptive-target",
                                         values = mapOf(
                                             DataType.Field.SINGLE to ai.adaptiveTargetWatts.toDouble(),
                                             "bonk_risk_pct" to ai.bonkRiskPercent.toDouble()
@@ -110,7 +110,7 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
                             emitter.onNext(
                                 StreamState.Streaming(
                                     DataPoint(
-                                        dataTypeId = dataTypeId,
+                                        dataTypeId = "w-prime-balance",
                                         values = mapOf(
                                             DataType.Field.SINGLE to metrics.wPrimeBalanceKj,
                                             "w_prime_pct" to metrics.wPrimePercent.toDouble()
@@ -133,7 +133,7 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
                             emitter.onNext(
                                 StreamState.Streaming(
                                     DataPoint(
-                                        dataTypeId = dataTypeId,
+                                        dataTypeId = "np-if-tss-summary",
                                         values = mapOf(
                                             DataType.Field.SINGLE to metrics.normalizedPower.toDouble(),
                                             "intensity_factor" to metrics.intensityFactor,
@@ -157,7 +157,7 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
                             emitter.onNext(
                                 StreamState.Streaming(
                                     DataPoint(
-                                        dataTypeId = dataTypeId,
+                                        dataTypeId = "ai-fueling-timer",
                                         values = mapOf(
                                             DataType.Field.SINGLE to ai.nextCarbIntakeMinutes.toDouble(),
                                             "carbs_g_hr" to ai.recommendedCarbsGramsPerHour.toDouble(),
@@ -184,11 +184,7 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
         }
     }
 
-    /**
-     * Handles BonusAction clicks from SRAM AXS / Shimano Di2 hood buttons or Karoo drawer
-     * to open the separate All-Metrics Pro Window (`MetricsDashboardActivity`).
-     */
-    override fun onBonusAction(actionId: String) {
+    fun onBonusAction(actionId: String) {
         if (actionId == "open-all-metrics-window") {
             val intent = Intent(applicationContext, MetricsDashboardActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
@@ -197,56 +193,68 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
         }
     }
 
-    /**
-     * Safely extracts the single numeric value from an OnStreamState event.
-     */
-    private fun extractSingleValue(event: Any): Double? {
+    private fun resolveDataType(fieldName: String, fallback: String): String {
         return try {
-            val streaming = event.javaClass.declaredFields.firstNotNullOfOrNull { f ->
+            DataType.Type::class.java.getDeclaredField(fieldName).get(null) as? String ?: fallback
+        } catch (_: Exception) {
+            fallback
+        }
+    }
+
+    private fun extractSingleValue(event: OnStreamState): Double? {
+        return try {
+            for (f in event.javaClass.declaredFields) {
                 f.isAccessible = true
-                f.get(event) as? StreamState.Streaming
-            } ?: return null
-            val dp = streaming.javaClass.declaredFields.firstNotNullOfOrNull { f ->
-                f.isAccessible = true
-                f.get(streaming) as? DataPoint
-            } ?: return null
-            val map = dp.javaClass.declaredFields.firstNotNullOfOrNull { f ->
-                f.isAccessible = true
-                f.get(dp) as? Map<*, *>
+                val v = f.get(event)
+                if (v is StreamState.Streaming) {
+                    return v.dataPoint.values[DataType.Field.SINGLE]
+                }
             }
-            (map?.get(DataType.Field.SINGLE) as? Number)?.toDouble()
+            null
         } catch (_: Exception) {
             null
         }
     }
 
     private fun subscribeToKarooStreams() {
-        karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.POWER)) { event ->
+        karooSystem.addConsumer<OnStreamState>(
+            OnStreamState.StartStreaming(resolveDataType("POWER", "TYPE_POWER_ID"))
+        ) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestPower = it.toInt()
             }
         }
-        karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.HEART_RATE)) { event ->
+        karooSystem.addConsumer<OnStreamState>(
+            OnStreamState.StartStreaming(resolveDataType("HEART_RATE", "TYPE_HEART_RATE_ID"))
+        ) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestHr = it.toInt()
             }
         }
-        karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.CADENCE)) { event ->
+        karooSystem.addConsumer<OnStreamState>(
+            OnStreamState.StartStreaming(resolveDataType("CADENCE", "TYPE_CADENCE_ID"))
+        ) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestCadence = it.toInt()
             }
         }
-        karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.SPEED)) { event ->
+        karooSystem.addConsumer<OnStreamState>(
+            OnStreamState.StartStreaming(resolveDataType("SPEED", "TYPE_SPEED_ID"))
+        ) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestSpeedKmh = it * 3.6 // m/s to km/h
             }
         }
-        karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.DISTANCE)) { event ->
+        karooSystem.addConsumer<OnStreamState>(
+            OnStreamState.StartStreaming(resolveDataType("DISTANCE", "TYPE_DISTANCE_ID"))
+        ) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestDistanceKm = it / 1000.0
             }
         }
-        karooSystem.addConsumer(OnStreamState.StartStreaming(DataType.Type.ELEVATION_GRADE)) { event ->
+        karooSystem.addConsumer<OnStreamState>(
+            OnStreamState.StartStreaming(resolveDataType("ELEVATION_GRADE", "TYPE_ELEVATION_GRADE_ID"))
+        ) { event: OnStreamState ->
             extractSingleValue(event)?.let {
                 latestGradePct = it
             }
