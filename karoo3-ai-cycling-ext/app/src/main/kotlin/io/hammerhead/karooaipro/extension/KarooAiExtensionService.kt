@@ -20,7 +20,6 @@ import io.hammerhead.karooaipro.engine.CyclingMetricsSnapshot
 import io.hammerhead.karooaipro.engine.OnDeviceAiCoachEngine
 import io.hammerhead.karooaipro.engine.WindVectorReport
 import io.hammerhead.karooaipro.engine.WindWeatherEngine
-import io.hammerhead.karooaipro.ui.MetricsDashboardActivity
 import io.hammerhead.karooext.KarooSystemService
 import io.hammerhead.karooext.extension.KarooExtension
 import io.hammerhead.karooext.models.DataType
@@ -34,6 +33,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -49,11 +53,8 @@ class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
         SharedTelemetryBus.ensureStarted(applicationContext)
     }
 
-    fun openAllMetricsWindow() {
-        val intent = Intent(applicationContext, MetricsDashboardActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        }
-        startActivity(intent)
+    override fun onDestroy() {
+        super.onDestroy()
     }
 }
 
@@ -64,6 +65,10 @@ data class GpsTrackPoint(
     val speedKmh: Double,
     val gradePct: Double,
     val headwindKmh: Double,
+    val powerWatts: Int = 0,
+    val heartRateBpm: Int = 0,
+    val cadenceRpm: Int = 0,
+    val temperatureC: Double = 24.0,
     val timestampMs: Long
 )
 
@@ -79,7 +84,17 @@ data class LiveSensorDiagnostics(
     val longitude: Double = -100.9522,
     val bearingDeg: Int = 35,
     val gpsAccuracyMeters: Float = 8f,
-    val trackPoints: List<GpsTrackPoint> = emptyList()
+    val trackPoints: List<GpsTrackPoint> = emptyList(),
+    val isRecordingRide: Boolean = false,
+    val recordingElapsedSeconds: Long = 0L,
+    val recordedTrackPointsCount: Int = 0,
+    val lastExportedGpxPath: String = "",
+    val powerHistory30s: List<Int> = emptyList(),
+    val avgPowerWatts: Int = 0,
+    val maxPowerWatts: Int = 0,
+    val efficiencyFactor: Double = 1.58,
+    val timeToExhaustionMinutes: Int = 99,
+    val glycogenRemainingPct: Int = 92
 )
 
 object SharedTelemetryBus {
@@ -118,7 +133,17 @@ object SharedTelemetryBus {
     @Volatile private var karooConnected: Boolean = false
     @Volatile private var demoMode: Boolean = false
 
+    @Volatile private var recordingRide: Boolean = false
+    @Volatile private var recordingElapsedSec: Long = 0L
+    @Volatile private var lastExportedGpxFile: String = ""
+
+    @Volatile private var powerSumTotal: Long = 0L
+    @Volatile private var powerSampleCount: Long = 0L
+    @Volatile private var maxPowerRecorded: Int = 0
+
     private val trackHistory = CopyOnWriteArrayList<GpsTrackPoint>()
+    private val recordedRidePoints = CopyOnWriteArrayList<GpsTrackPoint>()
+    private val powerHistoryBuffer = CopyOnWriteArrayList<Int>()
     private var prevGpsLocation: Location? = null
     private var prevGradeAltitude: Double? = null
     private var prevGradeDistanceKm: Double = 0.0
@@ -177,12 +202,100 @@ object SharedTelemetryBus {
             latestHr = 0
             latestCadence = 0
             latestSpeedKmh = 0.0
+            powerSumTotal = 0L
+            powerSampleCount = 0L
+            maxPowerRecorded = 0
         }
     }
 
     fun isDemoMode(): Boolean = demoMode
     fun requestPageChange(targetPage: Int) { externalPageCommand.set(targetPage) }
     fun consumePageCommand(): Int = externalPageCommand.getAndSet(-1)
+
+    fun startRideRecording() {
+        recordedRidePoints.clear()
+        recordingElapsedSec = 0L
+        latestDistanceKm = 0.0
+        powerSumTotal = 0L
+        powerSampleCount = 0L
+        maxPowerRecorded = 0
+        recordingRide = true
+        appendTrackPoint(latestLat, latestLon, force = true)
+    }
+
+    fun isRecordingRide(): Boolean = recordingRide
+
+    fun stopAndExportGpx(context: Context): String {
+        recordingRide = false
+        val exportPoints = if (recordedRidePoints.isNotEmpty()) recordedRidePoints.toList() else trackHistory.toList()
+        if (exportPoints.isEmpty()) {
+            appendTrackPoint(latestLat, latestLon, force = true)
+        }
+
+        val isoFmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+        val fileStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val fileName = "Karoo3_Strava_Ride_$fileStamp.gpx"
+
+        val sb = StringBuilder()
+        sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+        sb.append("<gpx creator=\"Hammerhead Karoo 3 AI Pro\" version=\"1.1\" ")
+        sb.append("xmlns=\"http://www.topografix.com/GPX/1/1\" ")
+        sb.append("xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" ")
+        sb.append("xmlns:gpxtpx=\"http://www.garmin.com/xmlschemas/TrackPointExtension/v1\">\n")
+        sb.append("  <metadata>\n")
+        sb.append("    <name>Karoo 3 AI Pro Ride ($fileStamp)</name>\n")
+        sb.append("    <time>${isoFmt.format(Date(exportPoints.firstOrNull()?.timestampMs ?: System.currentTimeMillis()))}</time>\n")
+        sb.append("  </metadata>\n")
+        sb.append("  <trk>\n")
+        sb.append("    <name>Karoo 3 Cycling Route</name>\n")
+        sb.append("    <type>cycling</type>\n")
+        sb.append("    <trkseg>\n")
+        for (pt in exportPoints) {
+            val tStr = isoFmt.format(Date(pt.timestampMs))
+            sb.append("      <trkpt lat=\"${String.format(Locale.US, "%.6f", pt.lat)}\" lon=\"${String.format(Locale.US, "%.6f", pt.lon)}\">\n")
+            sb.append("        <ele>${String.format(Locale.US, "%.1f", pt.altitudeMeters)}</ele>\n")
+            sb.append("        <time>$tStr</time>\n")
+            sb.append("        <extensions>\n")
+            sb.append("          <power>${pt.powerWatts}</power>\n")
+            sb.append("          <gpxtpx:TrackPointExtension>\n")
+            sb.append("            <gpxtpx:atemp>${String.format(Locale.US, "%.1f", pt.temperatureC)}</gpxtpx:atemp>\n")
+            sb.append("            <gpxtpx:hr>${pt.heartRateBpm}</gpxtpx:hr>\n")
+            sb.append("            <gpxtpx:cad>${pt.cadenceRpm}</gpxtpx:cad>\n")
+            sb.append("          </gpxtpx:TrackPointExtension>\n")
+            sb.append("        </extensions>\n")
+            sb.append("      </trkpt>\n")
+        }
+        sb.append("    </trkseg>\n")
+        sb.append("  </trk>\n")
+        sb.append("</gpx>\n")
+
+        return try {
+            val dir = context.getExternalFilesDir(null) ?: context.filesDir
+            val outFile = File(dir, fileName)
+            outFile.writeText(sb.toString())
+            lastExportedGpxFile = outFile.absolutePath
+
+            try {
+                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "application/gpx+xml"
+                    putExtra(Intent.EXTRA_SUBJECT, "Karoo 3 Strava GPX - $fileName")
+                    putExtra(Intent.EXTRA_TEXT, sb.toString())
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                val chooser = Intent.createChooser(shareIntent, "Exportar Ruta a Strava (.GPX)").apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(chooser)
+            } catch (_: Exception) {}
+
+            fileName
+        } catch (e: Exception) {
+            lastExportedGpxFile = "Error: ${e.message}"
+            lastExportedGpxFile
+        }
+    }
 
     private fun appendTrackPoint(lat: Double, lon: Double, force: Boolean = false) {
         if (lat == 0.0 && lon == 0.0) return
@@ -194,14 +307,24 @@ object SharedTelemetryBus {
             if (distM < 2.5) return
         }
         val currentWind = snapshot.second
-        trackHistory.add(
-            GpsTrackPoint(
-                lat = lat, lon = lon, altitudeMeters = baroAltitudeMeters,
-                speedKmh = latestSpeedKmh, gradePct = latestGradePct,
-                headwindKmh = currentWind.headwindKmh, timestampMs = System.currentTimeMillis()
-            )
+        val newPt = GpsTrackPoint(
+            lat = lat,
+            lon = lon,
+            altitudeMeters = baroAltitudeMeters,
+            speedKmh = latestSpeedKmh,
+            gradePct = latestGradePct,
+            headwindKmh = currentWind.headwindKmh,
+            powerWatts = latestPower,
+            heartRateBpm = latestHr,
+            cadenceRpm = latestCadence,
+            temperatureC = currentWind.temperatureC,
+            timestampMs = System.currentTimeMillis()
         )
+        trackHistory.add(newPt)
         if (trackHistory.size > 600) trackHistory.removeAt(0)
+        if (recordingRide) {
+            recordedRidePoints.add(newPt)
+        }
     }
 
     private fun startKarooSystemConnection(appCtx: Context) {
@@ -371,29 +494,80 @@ object SharedTelemetryBus {
         scope.launch {
             while (isActive) {
                 elapsedSec += 1
+                if (recordingRide) {
+                    recordingElapsedSec += 1
+                }
                 if (demoMode) {
-                    latestPower = 248 + ((elapsedSec % 7).toInt() - 3) * 6
+                    latestPower = 248 + ((elapsedSec % 9).toInt() - 4) * 14
                     latestHr = 161 + ((elapsedSec % 5).toInt() - 2)
                     latestCadence = 90 + ((elapsedSec % 3).toInt() - 1)
                     latestSpeedKmh = 34.2
-                    latestDistanceKm += 34.2 / 3600.0
+                    if (recordingRide) {
+                        latestDistanceKm += 34.2 / 3600.0
+                    }
                     latestGradePct = 2.4
+                    latestBearingDeg = ((latestBearingDeg + 4) % 360)
+                    val rad = latestBearingDeg * PI / 180.0
+                    latestLat += (cos(rad) * 0.00009)
+                    latestLon += (sin(rad) * 0.00009)
+                    appendTrackPoint(latestLat, latestLon, force = true)
+                } else if (recordingRide && gpsActive) {
+                    appendTrackPoint(latestLat, latestLon, force = (recordingElapsedSec % 5L == 0L))
                 }
+
                 val metrics = calculator.updateOneSecondSample(
                     powerWatts = latestPower, heartRateBpm = latestHr, cadenceRpm = latestCadence,
                     speedKmh = latestSpeedKmh, distanceKm = latestDistanceKm, gradePercent = latestGradePct
                 )
+                if (metrics.powerInstant > 0) {
+                    powerSumTotal += metrics.powerInstant
+                    powerSampleCount += 1L
+                    if (metrics.powerInstant > maxPowerRecorded) {
+                        maxPowerRecorded = metrics.powerInstant
+                    }
+                }
+                val computedAvgW = if (powerSampleCount > 0L) (powerSumTotal / powerSampleCount).toInt() else 0
+                val computedMaxW = maxPowerRecorded.coerceAtLeast(metrics.power3s)
+
+                powerHistoryBuffer.add(metrics.power3s)
+                while (powerHistoryBuffer.size > 32) {
+                    powerHistoryBuffer.removeAt(0)
+                }
+
                 val wind = windEngine.computeWindVector(
                     riderHeadingDeg = latestBearingDeg, riderSpeedKmh = latestSpeedKmh, cda = calculator.profile.cda
                 )
                 val ai = aiCoach.evaluate(metrics = metrics, wind = wind, profile = calculator.profile, elapsedSeconds = elapsedSec)
+
+                val efValue = if (metrics.heartRateBpm > 60) {
+                    ((metrics.normalizedPower.toDouble() / metrics.heartRateBpm.toDouble()) * 100.0).roundToInt() / 100.0
+                } else {
+                    1.58
+                }
+                val netDepletionWatts = (metrics.power3s - calculator.profile.ftpWatts).coerceAtLeast(0)
+                val tteMins = if (netDepletionWatts > 5) {
+                    ((metrics.wPrimeBalanceKj * 1000.0) / netDepletionWatts.toDouble() / 60.0).roundToInt().coerceIn(1, 90)
+                } else {
+                    99
+                }
+                val glycogenPct = (100.0 - (metrics.kilojoulesTotal / 24.0)).roundToInt().coerceIn(5, 100)
 
                 diagnostics = LiveSensorDiagnostics(
                     karooServiceConnected = karooConnected, gpsFixActive = gpsActive, barometerActive = baroActive,
                     altitudeMeters = (baroAltitudeMeters * 10.0).roundToInt() / 10.0, pressureHpa = baroPressureHpa,
                     activeStreamsCount = 4, demoModeEnabled = demoMode,
                     latitude = latestLat, longitude = latestLon, bearingDeg = latestBearingDeg,
-                    gpsAccuracyMeters = latestGpsAccuracyM, trackPoints = trackHistory.toList()
+                    gpsAccuracyMeters = latestGpsAccuracyM, trackPoints = trackHistory.toList(),
+                    isRecordingRide = recordingRide,
+                    recordingElapsedSeconds = recordingElapsedSec,
+                    recordedTrackPointsCount = recordedRidePoints.size,
+                    lastExportedGpxPath = lastExportedGpxFile,
+                    powerHistory30s = powerHistoryBuffer.toList(),
+                    avgPowerWatts = computedAvgW,
+                    maxPowerWatts = computedMaxW,
+                    efficiencyFactor = efValue,
+                    timeToExhaustionMinutes = tteMins,
+                    glycogenRemainingPct = glycogenPct
                 )
                 snapshot = Triple(metrics, wind, ai)
                 delay(1000L)
