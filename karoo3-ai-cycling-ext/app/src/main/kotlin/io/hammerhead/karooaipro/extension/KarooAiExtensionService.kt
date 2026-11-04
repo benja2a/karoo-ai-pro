@@ -1,1638 +1,562 @@
-package io.hammerhead.karooaipro.ui
+package io.hammerhead.karooaipro.extension
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Bundle
-import android.view.KeyEvent
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clipToBounds
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.rotate
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import android.os.Looper
+import io.hammerhead.karooaipro.engine.AdvancedCyclingCalculator
 import io.hammerhead.karooaipro.engine.AiHeuristicEvaluation
 import io.hammerhead.karooaipro.engine.CyclingMetricsSnapshot
+import io.hammerhead.karooaipro.engine.OnDeviceAiCoachEngine
 import io.hammerhead.karooaipro.engine.WindVectorReport
-import io.hammerhead.karooaipro.extension.LiveSensorDiagnostics
-import io.hammerhead.karooaipro.extension.SharedTelemetryBus
+import io.hammerhead.karooaipro.engine.WindWeatherEngine
+import io.hammerhead.karooext.KarooSystemService
+import io.hammerhead.karooext.extension.KarooExtension
+import io.hammerhead.karooext.models.DataType
+import io.hammerhead.karooext.models.OnLocationChanged
+import io.hammerhead.karooext.models.OnStreamState
+import io.hammerhead.karooext.models.StreamState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.net.HttpURLConnection
-import java.net.URL
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
+import java.util.TimeZone
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.cos
-import kotlin.math.floor
-import kotlin.math.ln
+import kotlin.math.roundToInt
 import kotlin.math.sin
-import kotlin.math.tan
 
-object LiveTileMapEngine {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val tileCache = ConcurrentHashMap<String, ImageBitmap>()
-    private val inFlight = ConcurrentHashMap.newKeySet<String>()
-    private val versionCounter = AtomicInteger(0)
+class KarooAiExtensionService : KarooExtension("karoo-ai-pro", "1.0.0") {
 
-    fun tileVersion(): Int = versionCounter.get()
-
-    fun getOrFetchTile(styleIndex: Int, z: Int, x: Int, y: Int): ImageBitmap? {
-        val maxTile = (1 shl z)
-        if (y < 0 || y >= maxTile) return null
-        val wrappedX = ((x % maxTile) + maxTile) % maxTile
-        val key = "$styleIndex:$z:$wrappedX:$y"
-
-        tileCache[key]?.let { return it }
-
-        if (inFlight.add(key)) {
-            scope.launch {
-                try {
-                    val urlStr = when (styleIndex) {
-                        1 -> "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/$z/$y/$wrappedX"
-                        2 -> "https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/$z/$y/$wrappedX"
-                        else -> "https://a.basemaps.cartocdn.com/rastertiles/voyager/$z/$wrappedX/$y.png"
-                    }
-                    val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
-                        requestMethod = "GET"
-                        connectTimeout = 7000
-                        readTimeout = 7000
-                        doInput = true
-                        setRequestProperty(
-                            "User-Agent",
-                            "Mozilla/5.0 (Linux; Android 12; Karoo3) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"
-                        )
-                    }
-                    if (conn.responseCode == 200) {
-                        val bytes = conn.inputStream.use { it.readBytes() }
-                        if (bytes.isNotEmpty()) {
-                            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                            if (bmp != null) {
-                                if (tileCache.size > 140) tileCache.clear()
-                                tileCache[key] = bmp.asImageBitmap()
-                                versionCounter.incrementAndGet()
-                            }
-                        }
-                    }
-                    conn.disconnect()
-                } catch (_: Exception) {
-                } finally {
-                    inFlight.remove(key)
-                }
-            }
-        }
-        return null
-    }
-}
-
-class MetricsDashboardActivity : ComponentActivity() {
-
-    private var pageState = mutableIntStateOf(0)
-    private var mapZoomState = mutableIntStateOf(16)
-    private var mapStyleState = mutableIntStateOf(0)
-    private var map3DState = mutableStateOf(true)
-    private var daylightState = mutableStateOf(false)
-    private var carbsLoggedState = mutableIntStateOf(0)
-    private var hydrationMlState = mutableIntStateOf(0)
-    private var lastBackPressMs: Long = 0L
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
+    override fun onCreate() {
+        super.onCreate()
         SharedTelemetryBus.ensureStarted(applicationContext)
-
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(
-                arrayOf(
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    Manifest.permission.ACCESS_COARSE_LOCATION
-                ),
-                1001
-            )
-        }
-
-        setContent {
-            KarooCleanCockpit(
-                currentPage = pageState.intValue,
-                onSelectPage = { newPage -> pageState.intValue = (newPage + 4) % 4 },
-                mapZoomLevel = mapZoomState.intValue,
-                onChangeZoom = { newZoom -> mapZoomState.intValue = newZoom.coerceIn(13, 18) },
-                mapStyleIndex = mapStyleState.intValue,
-                onCycleMapStyle = { mapStyleState.intValue = (mapStyleState.intValue + 1) % 3 },
-                is3DView = map3DState.value,
-                onToggle3D = { map3DState.value = !map3DState.value },
-                daylightMode = daylightState.value,
-                onToggleDaylight = { daylightState.value = !daylightState.value },
-                carbsLogged = carbsLoggedState.intValue,
-                onAddGel = { carbsLoggedState.intValue += 25 },
-                hydrationMl = hydrationMlState.intValue,
-                onAddSip = { hydrationMlState.intValue += 150 },
-                onToggleRideRecording = { toggleRideRecordingSilently() }
-            )
-        }
     }
 
-    private fun toggleRideRecordingSilently() {
-        if (!SharedTelemetryBus.isRecordingRide()) {
-            SharedTelemetryBus.startRideRecording()
-        } else {
-            SharedTelemetryBus.stopAndExportGpx(applicationContext)
-        }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        SharedTelemetryBus.startInternalHardwareSensors(applicationContext)
-    }
-
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-            val code = event.keyCode
-            val scan = event.scanCode
-
-            if (code == KeyEvent.KEYCODE_POWER || code == KeyEvent.KEYCODE_HOME) {
-                return super.dispatchKeyEvent(event)
-            }
-
-            when {
-                code == KeyEvent.KEYCODE_DPAD_LEFT ||
-                code == KeyEvent.KEYCODE_DPAD_UP ||
-                code == KeyEvent.KEYCODE_VOLUME_UP ||
-                code == KeyEvent.KEYCODE_PAGE_UP ||
-                code == KeyEvent.KEYCODE_MEDIA_PREVIOUS ||
-                code == KeyEvent.KEYCODE_NAVIGATE_PREVIOUS ||
-                code == KeyEvent.KEYCODE_SYSTEM_NAVIGATION_LEFT ||
-                code == KeyEvent.KEYCODE_BUTTON_L1 ||
-                code == KeyEvent.KEYCODE_F1 ||
-                code == KeyEvent.KEYCODE_SOFT_LEFT -> {
-                    pageState.intValue = (pageState.intValue + 3) % 4
-                    return true
-                }
-
-                code == KeyEvent.KEYCODE_DPAD_RIGHT ||
-                code == KeyEvent.KEYCODE_DPAD_DOWN ||
-                code == KeyEvent.KEYCODE_VOLUME_DOWN ||
-                code == KeyEvent.KEYCODE_PAGE_DOWN ||
-                code == KeyEvent.KEYCODE_MEDIA_NEXT ||
-                code == KeyEvent.KEYCODE_NAVIGATE_NEXT ||
-                code == KeyEvent.KEYCODE_SYSTEM_NAVIGATION_RIGHT ||
-                code == KeyEvent.KEYCODE_BUTTON_R1 ||
-                code == KeyEvent.KEYCODE_F2 ||
-                code == KeyEvent.KEYCODE_SOFT_RIGHT ||
-                code == KeyEvent.KEYCODE_STEM_1 ||
-                code == KeyEvent.KEYCODE_STEM_2 ||
-                code == KeyEvent.KEYCODE_STEM_3 -> {
-                    pageState.intValue = (pageState.intValue + 1) % 4
-                    return true
-                }
-
-                code == KeyEvent.KEYCODE_ENTER ||
-                code == KeyEvent.KEYCODE_DPAD_CENTER ||
-                code == KeyEvent.KEYCODE_NUMPAD_ENTER ||
-                code == KeyEvent.KEYCODE_SPACE ||
-                code == KeyEvent.KEYCODE_BUTTON_A ||
-                code == KeyEvent.KEYCODE_BUTTON_SELECT ||
-                code == KeyEvent.KEYCODE_BUTTON_R2 ||
-                code == KeyEvent.KEYCODE_F3 ||
-                code == KeyEvent.KEYCODE_F4 -> {
-                    triggerContextualButtonAction()
-                    return true
-                }
-
-                code == KeyEvent.KEYCODE_BACK ||
-                code == KeyEvent.KEYCODE_ESCAPE ||
-                code == KeyEvent.KEYCODE_BUTTON_B ||
-                code == KeyEvent.KEYCODE_BUTTON_L2 -> {
-                    val now = System.currentTimeMillis()
-                    if (pageState.intValue > 0) {
-                        pageState.intValue = (pageState.intValue + 3) % 4
-                        return true
-                    } else if (now - lastBackPressMs > 1800L) {
-                        lastBackPressMs = now
-                        return true
-                    }
-                    return super.dispatchKeyEvent(event)
-                }
-
-                scan > 0 -> {
-                    if (scan % 2 == 0) {
-                        pageState.intValue = (pageState.intValue + 1) % 4
-                    } else {
-                        pageState.intValue = (pageState.intValue + 3) % 4
-                    }
-                    return true
-                }
-            }
-        }
-        return super.dispatchKeyEvent(event)
-    }
-
-    private fun triggerContextualButtonAction() {
-        when (pageState.intValue) {
-            0 -> toggleRideRecordingSilently()
-            1 -> {
-                val nextZoom = if (mapZoomState.intValue >= 18) 14 else mapZoomState.intValue + 1
-                mapZoomState.intValue = nextZoom
-            }
-            2 -> daylightState.value = !daylightState.value
-            3 -> {
-                carbsLoggedState.intValue += 25
-                hydrationMlState.intValue += 150
-            }
-        }
+    override fun onDestroy() {
+        super.onDestroy()
     }
 }
 
-@Composable
-fun KarooCleanCockpit(
-    currentPage: Int,
-    onSelectPage: (Int) -> Unit,
-    mapZoomLevel: Int,
-    onChangeZoom: (Int) -> Unit,
-    mapStyleIndex: Int,
-    onCycleMapStyle: () -> Unit,
-    is3DView: Boolean,
-    onToggle3D: () -> Unit,
-    daylightMode: Boolean,
-    onToggleDaylight: () -> Unit,
-    carbsLogged: Int,
-    onAddGel: () -> Unit,
-    hydrationMl: Int,
-    onAddSip: () -> Unit,
-    onToggleRideRecording: () -> Unit
-) {
-    var telemetry by remember { mutableStateOf(SharedTelemetryBus.latestState()) }
-    var diag by remember { mutableStateOf(SharedTelemetryBus.latestDiagnostics()) }
-    var elapsedRideSec by remember { mutableIntStateOf(0) }
-    var tileRefreshTick by remember { mutableIntStateOf(0) }
+data class GpsTrackPoint(
+    val lat: Double,
+    val lon: Double,
+    val altitudeMeters: Double,
+    val speedKmh: Double,
+    val gradePct: Double,
+    val headwindKmh: Double,
+    val powerWatts: Int = 0,
+    val heartRateBpm: Int = 0,
+    val cadenceRpm: Int = 0,
+    val temperatureC: Double = 24.0,
+    val timestampMs: Long
+)
 
-    LaunchedEffect(Unit) {
-        while (true) {
-            telemetry = SharedTelemetryBus.latestState()
-            diag = SharedTelemetryBus.latestDiagnostics()
-            elapsedRideSec += 1
-            tileRefreshTick = LiveTileMapEngine.tileVersion()
-            val extCmd = SharedTelemetryBus.consumePageCommand()
-            if (extCmd in 0..3) {
-                onSelectPage(extCmd)
-            }
-            delay(1000L)
+data class LiveSensorDiagnostics(
+    val karooServiceConnected: Boolean = false,
+    val gpsFixActive: Boolean = false,
+    val barometerActive: Boolean = false,
+    val altitudeMeters: Double = 280.0,
+    val pressureHpa: Double = 1013.25,
+    val activeStreamsCount: Int = 0,
+    val demoModeEnabled: Boolean = false,
+    val latitude: Double = 29.3242,
+    val longitude: Double = -100.9522,
+    val bearingDeg: Int = 35,
+    val gpsAccuracyMeters: Float = 8f,
+    val trackPoints: List<GpsTrackPoint> = emptyList(),
+    val isRecordingRide: Boolean = false,
+    val recordingElapsedSeconds: Long = 0L,
+    val recordedTrackPointsCount: Int = 0,
+    val lastExportedGpxPath: String = "",
+    val powerHistory30s: List<Int> = emptyList(),
+    val avgPowerWatts: Int = 0,
+    val maxPowerWatts: Int = 0,
+    val efficiencyFactor: Double = 1.58,
+    val timeToExhaustionMinutes: Int = 99,
+    val glycogenRemainingPct: Int = 92
+)
+
+object SharedTelemetryBus {
+
+    private val started = AtomicBoolean(false)
+    private val gpsListening = AtomicBoolean(false)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private var karooSystem: KarooSystemService? = null
+    private val calculator = AdvancedCyclingCalculator()
+    private val windEngine = WindWeatherEngine()
+    private val aiCoach = OnDeviceAiCoachEngine()
+
+    @Volatile private var latestPower: Int = 0
+    @Volatile private var latestHr: Int = 0
+    @Volatile private var latestCadence: Int = 0
+    @Volatile private var latestSpeedKmh: Double = 0.0
+    @Volatile private var latestDistanceKm: Double = 0.0
+    @Volatile private var latestGradePct: Double = 0.0
+    @Volatile private var latestLat: Double = 29.3242
+    @Volatile private var latestLon: Double = -100.9522
+    @Volatile private var latestBearingDeg: Int = 35
+    @Volatile private var latestGpsAccuracyM: Float = 8f
+
+    @Volatile private var lastKarooSpeedMs: Long = 0L
+    @Volatile private var lastKarooDistMs: Long = 0L
+    @Volatile private var lastKarooGradeMs: Long = 0L
+    @Volatile private var lastKarooPowerMs: Long = 0L
+    @Volatile private var lastKarooHrMs: Long = 0L
+    @Volatile private var lastKarooCadMs: Long = 0L
+
+    @Volatile private var baroAltitudeMeters: Double = 280.0
+    @Volatile private var baroPressureHpa: Double = 1013.25
+    @Volatile private var baroActive: Boolean = false
+    @Volatile private var gpsActive: Boolean = false
+    @Volatile private var karooConnected: Boolean = false
+    @Volatile private var demoMode: Boolean = false
+
+    @Volatile private var recordingRide: Boolean = false
+    @Volatile private var recordingElapsedSec: Long = 0L
+    @Volatile private var lastExportedGpxFile: String = ""
+
+    @Volatile private var powerSumTotal: Long = 0L
+    @Volatile private var powerSampleCount: Long = 0L
+    @Volatile private var maxPowerRecorded: Int = 0
+
+    private val trackHistory = CopyOnWriteArrayList<GpsTrackPoint>()
+    private val recordedRidePoints = CopyOnWriteArrayList<GpsTrackPoint>()
+    private val powerHistoryBuffer = CopyOnWriteArrayList<Int>()
+    private var prevGpsLocation: Location? = null
+    private var elapsedSec: Long = 0L
+    private val weatherFetchedOnce = AtomicBoolean(false)
+    private val externalPageCommand = AtomicInteger(-1)
+
+    @Volatile
+    private var diagnostics: LiveSensorDiagnostics = LiveSensorDiagnostics()
+
+    @Volatile
+    private var snapshot: Triple<CyclingMetricsSnapshot, WindVectorReport, AiHeuristicEvaluation> =
+        Triple(
+            CyclingMetricsSnapshot(
+                powerInstant = 0, power3s = 0, normalizedPower = 0,
+                intensityFactor = 0.0, tss = 0.0, ftpPercent = 0,
+                powerZone = 1, powerZoneName = "Z1 REC",
+                wPrimeBalanceKj = 22.0, wPrimePercent = 100,
+                heartRateBpm = 0, hrZone = 1, cadenceRpm = 0,
+                speedKmh = 0.0, distanceKm = 0.0, gradePercent = 0.0,
+                vamMetersPerHour = 0, kilojoulesTotal = 0.0,
+                segmentDeltaSeconds = 0.0, aerobicDecouplingPercent = 0.0
+            ),
+            WindVectorReport(
+                riderHeadingDeg = 35, trueWindDirectionDeg = 15,
+                trueWindSpeedKmh = 14.0, windGustsKmh = 19.0,
+                relativeWindAngleDeg = -20, headwindKmh = 13.1,
+                crosswindKmh = -4.8, aeroPowerImpactWatts = 0,
+                windImpactLabel = "METEO LISTO",
+                temperatureC = 24.0, humidityPct = 45, precipitationMm = 0.0
+            ),
+            AiHeuristicEvaluation(
+                adaptiveTargetWatts = 220, bonkRiskPercent = 5,
+                bonkStatusLabel = "GLUCÓGENO ÓPTIMO",
+                recommendedCarbsGramsPerHour = 60, recommendedHydrationMlPerHour = 600,
+                nextCarbIntakeMinutes = 20, nextHydrationMinutes = 10,
+                tacticalHeadline = "SENSORES LISTOS",
+                tacticalReason = "Esperando pedaleo o movimiento GPS en vivo.",
+                shouldTriggerInRideAlert = false
+            )
+        )
+
+    fun ensureStarted(context: Context) {
+        val appCtx = context.applicationContext
+        startInternalHardwareSensors(appCtx)
+        if (started.compareAndSet(false, true)) {
+            startKarooSystemConnection(appCtx)
+            startLoops()
         }
     }
 
-    val (metrics, wind, ai) = telemetry
-    val bgColor = if (daylightMode) Color(0xFFF1F5F9) else Color(0xFF070B12)
-    val cardBg = if (daylightMode) Color(0xFFFFFFFF) else Color(0xFF111827)
-    val borderCol = if (daylightMode) Color(0xFFCBD5E1) else Color(0xFF1E293B)
-    val primaryText = if (daylightMode) Color(0xFF0F172A) else Color(0xFFFFFFFF)
-    val secondaryText = if (daylightMode) Color(0xFF475569) else Color(0xFF94A3B8)
+    fun setDemoMode(enabled: Boolean) {
+        demoMode = enabled
+        if (!enabled) {
+            latestPower = 0
+            latestHr = 0
+            latestCadence = 0
+            latestSpeedKmh = 0.0
+            powerSumTotal = 0L
+            powerSampleCount = 0L
+            maxPowerRecorded = 0
+        }
+    }
 
-    Surface(
-        modifier = Modifier
-            .fillMaxSize()
-            .pointerInput(currentPage) {
-                var totalDrag = 0f
-                detectHorizontalDragGestures(
-                    onDragStart = { totalDrag = 0f },
-                    onDragEnd = {
-                        if (totalDrag < -55f) {
-                            onSelectPage(currentPage + 1)
-                        } else if (totalDrag > 55f) {
-                            onSelectPage(currentPage - 1)
+    fun isDemoMode(): Boolean = demoMode
+    fun requestPageChange(targetPage: Int) { externalPageCommand.set(targetPage) }
+    fun consumePageCommand(): Int = externalPageCommand.getAndSet(-1)
+
+    fun startRideRecording() {
+        recordedRidePoints.clear()
+        recordingElapsedSec = 0L
+        latestDistanceKm = 0.0
+        powerSumTotal = 0L
+        powerSampleCount = 0L
+        maxPowerRecorded = 0
+        recordingRide = true
+        appendTrackPoint(latestLat, latestLon, force = true)
+    }
+
+    fun isRecordingRide(): Boolean = recordingRide
+
+    fun stopAndExportGpx(context: Context): String {
+        recordingRide = false
+        val exportPoints = if (recordedRidePoints.isNotEmpty()) recordedRidePoints.toList() else trackHistory.toList()
+        if (exportPoints.isEmpty()) {
+            appendTrackPoint(latestLat, latestLon, force = true)
+        }
+
+        val isoFmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+        val fileStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val fileName = "Karoo3_Strava_Ride_$fileStamp.gpx"
+
+        val sb = StringBuilder()
+        sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+        sb.append("<gpx creator=\"Hammerhead Karoo 3 AI Pro\" version=\"1.1\" ")
+        sb.append("xmlns=\"http://www.topografix.com/GPX/1/1\" ")
+        sb.append("xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" ")
+        sb.append("xmlns:gpxtpx=\"http://www.garmin.com/xmlschemas/TrackPointExtension/v1\">\n")
+        sb.append("  <metadata>\n")
+        sb.append("    <name>Karoo 3 AI Pro Ride ($fileStamp)</name>\n")
+        sb.append("    <time>${isoFmt.format(Date(exportPoints.firstOrNull()?.timestampMs ?: System.currentTimeMillis()))}</time>\n")
+        sb.append("  </metadata>\n")
+        sb.append("  <trk>\n")
+        sb.append("    <name>Karoo 3 Cycling Route</name>\n")
+        sb.append("    <type>cycling</type>\n")
+        sb.append("    <trkseg>\n")
+        for (pt in exportPoints) {
+            val tStr = isoFmt.format(Date(pt.timestampMs))
+            sb.append("      <trkpt lat=\"${String.format(Locale.US, "%.6f", pt.lat)}\" lon=\"${String.format(Locale.US, "%.6f", pt.lon)}\">\n")
+            sb.append("        <ele>${String.format(Locale.US, "%.1f", pt.altitudeMeters)}</ele>\n")
+            sb.append("        <time>$tStr</time>\n")
+            sb.append("        <extensions>\n")
+            sb.append("          <power>${pt.powerWatts}</power>\n")
+            sb.append("          <gpxtpx:TrackPointExtension>\n")
+            sb.append("            <gpxtpx:atemp>${String.format(Locale.US, "%.1f", pt.temperatureC)}</gpxtpx:atemp>\n")
+            sb.append("            <gpxtpx:hr>${pt.heartRateBpm}</gpxtpx:hr>\n")
+            sb.append("            <gpxtpx:cad>${pt.cadenceRpm}</gpxtpx:cad>\n")
+            sb.append("          </gpxtpx:TrackPointExtension>\n")
+            sb.append("        </extensions>\n")
+            sb.append("      </trkpt>\n")
+        }
+        sb.append("    </trkseg>\n")
+        sb.append("  </trk>\n")
+        sb.append("</gpx>\n")
+
+        return try {
+            val dir = context.getExternalFilesDir(null) ?: context.filesDir
+            val outFile = File(dir, fileName)
+            outFile.writeText(sb.toString())
+            lastExportedGpxFile = outFile.absolutePath
+            fileName
+        } catch (e: Exception) {
+            lastExportedGpxFile = "Error: ${e.message}"
+            lastExportedGpxFile
+        }
+    }
+
+    private fun appendTrackPoint(lat: Double, lon: Double, force: Boolean = false) {
+        if (lat == 0.0 && lon == 0.0) return
+        val last = trackHistory.lastOrNull()
+        if (last != null && !force) {
+            val dLat = (lat - last.lat) * 111320.0
+            val dLon = (lon - last.lon) * 111320.0 * cos(lat * PI / 180.0)
+            val distM = kotlin.math.sqrt(dLat * dLat + dLon * dLon)
+            if (distM < 2.5) return
+        }
+        val currentWind = snapshot.second
+        val newPt = GpsTrackPoint(
+            lat = lat,
+            lon = lon,
+            altitudeMeters = baroAltitudeMeters,
+            speedKmh = latestSpeedKmh,
+            gradePct = latestGradePct,
+            headwindKmh = currentWind.headwindKmh,
+            powerWatts = latestPower,
+            heartRateBpm = latestHr,
+            cadenceRpm = latestCadence,
+            temperatureC = currentWind.temperatureC,
+            timestampMs = System.currentTimeMillis()
+        )
+        trackHistory.add(newPt)
+        if (trackHistory.size > 600) trackHistory.removeAt(0)
+        if (recordingRide) {
+            recordedRidePoints.add(newPt)
+        }
+    }
+
+    private fun startKarooSystemConnection(appCtx: Context) {
+        try {
+            val service = KarooSystemService(appCtx)
+            karooSystem = service
+            service.connect {
+                karooConnected = true
+                subscribeToKarooStreams(service)
+            }
+        } catch (_: Exception) {
+            karooConnected = false
+        }
+    }
+
+    private fun extractSingleValue(event: OnStreamState): Double? {
+        return try {
+            for (field in event.javaClass.declaredFields) {
+                field.isAccessible = true
+                val v = field.get(event)
+                if (v is StreamState.Streaming) {
+                    val dp = v.dataPoint
+                    return dp.values[DataType.Field.SINGLE] ?: dp.values.values.firstOrNull()
+                }
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun subscribeToKarooStreams(service: KarooSystemService) {
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.POWER)) { event: OnStreamState ->
+            extractSingleValue(event)?.let {
+                latestPower = it.roundToInt().coerceAtLeast(0)
+                lastKarooPowerMs = System.currentTimeMillis()
+            }
+        }
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.HEART_RATE)) { event: OnStreamState ->
+            extractSingleValue(event)?.let {
+                latestHr = it.roundToInt().coerceAtLeast(0)
+                lastKarooHrMs = System.currentTimeMillis()
+            }
+        }
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.CADENCE)) { event: OnStreamState ->
+            extractSingleValue(event)?.let {
+                latestCadence = it.roundToInt().coerceAtLeast(0)
+                lastKarooCadMs = System.currentTimeMillis()
+            }
+        }
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.SPEED)) { event: OnStreamState ->
+            extractSingleValue(event)?.let {
+                latestSpeedKmh = (it * 3.6).coerceAtLeast(0.0)
+                lastKarooSpeedMs = System.currentTimeMillis()
+            }
+        }
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.DISTANCE)) { event: OnStreamState ->
+            extractSingleValue(event)?.let {
+                latestDistanceKm = (it / 1000.0).coerceAtLeast(0.0)
+                lastKarooDistMs = System.currentTimeMillis()
+            }
+        }
+        service.addConsumer<OnStreamState>(OnStreamState.StartStreaming(DataType.Type.ELEVATION_GRADE)) { event: OnStreamState ->
+            extractSingleValue(event)?.let {
+                latestGradePct = it.coerceIn(-35.0, 35.0)
+                lastKarooGradeMs = System.currentTimeMillis()
+            }
+        }
+        service.addConsumer<OnLocationChanged> { loc: OnLocationChanged ->
+            if (loc.lat != 0.0 || loc.lng != 0.0) {
+                latestLat = loc.lat
+                latestLon = loc.lng
+                gpsActive = true
+                latestBearingDeg = windEngine.updateGpsPosition(loc.lat, loc.lng)
+                appendTrackPoint(loc.lat, loc.lng)
+                if (weatherFetchedOnce.compareAndSet(false, true)) {
+                    scope.launch { windEngine.fetchWeatherBlocking(latestLat, latestLon) }
+                }
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startInternalHardwareSensors(context: Context) {
+        val appCtx = context.applicationContext
+        try {
+            val sensorManager = appCtx.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+            val pressureSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_PRESSURE)
+            if (pressureSensor != null && !baroActive) {
+                baroActive = true
+                sensorManager.registerListener(
+                    object : SensorEventListener {
+                        override fun onSensorChanged(event: SensorEvent?) {
+                            val hpa = event?.values?.firstOrNull() ?: return
+                            if (hpa > 300f && hpa < 1100f) {
+                                baroPressureHpa = (hpa * 10.0).roundToInt() / 10.0
+                                val rawAlt = SensorManager.getAltitude(SensorManager.PRESSURE_STANDARD_ATMOSPHERE, hpa).toDouble()
+                                baroAltitudeMeters = if (baroAltitudeMeters == 280.0) rawAlt else baroAltitudeMeters * 0.85 + rawAlt * 0.15
+                            }
                         }
+                        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
                     },
-                    onHorizontalDrag = { _, dragAmount ->
-                        totalDrag += dragAmount
-                    }
+                    pressureSensor,
+                    SensorManager.SENSOR_DELAY_NORMAL
                 )
-            },
-        color = bgColor
-    ) {
-        Column(modifier = Modifier.fillMaxSize()) {
+            }
+        } catch (_: Exception) {}
 
-            // 1. ULTRA-CLEAN COMPACT SINGLE-LINE STATUS BAR (NO TOAST NOTIFICATIONS)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF0B111E))
-                    .padding(horizontal = 8.dp, vertical = 5.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                val activeSec = if (diag.isRecordingRide) diag.recordingElapsedSeconds.toInt() else elapsedRideSec
-                val mins = (activeSec / 60).toString().padStart(2, '0')
-                val secs = (activeSec % 60).toString().padStart(2, '0')
-                val recBadge = if (diag.isRecordingRide) "REC" else "PAUSA"
-                val gpsTag = if (diag.gpsFixActive) "GPS OK" else "GPS"
-                val statusText = "$recBadge $mins:$secs • $gpsTag • ${diag.altitudeMeters.toInt()}m"
+        val hasFine = appCtx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val hasCoarse = appCtx.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if ((!hasFine && !hasCoarse) || !gpsListening.compareAndSet(false, true)) return
 
-                Text(
-                    text = statusText,
-                    color = if (diag.isRecordingRide) Color(0xFFF87171) else Color(0xFF34D399),
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    maxLines = 1
+        try {
+            val locationManager = appCtx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
+            val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+            for (prov in providers) {
+                try {
+                    val lastLoc = locationManager.getLastKnownLocation(prov)
+                    if (lastLoc != null && (lastLoc.latitude != 0.0 || lastLoc.longitude != 0.0)) {
+                        latestLat = lastLoc.latitude
+                        latestLon = lastLoc.longitude
+                        gpsActive = true
+                        appendTrackPoint(lastLoc.latitude, lastLoc.longitude, force = true)
+                        break
+                    }
+                } catch (_: Exception) {}
+            }
+
+            val listener = object : LocationListener {
+                override fun onLocationChanged(location: Location) {
+                    if (location.latitude == 0.0 && location.longitude == 0.0) return
+                    gpsActive = true
+                    latestLat = location.latitude
+                    latestLon = location.longitude
+                    val now = System.currentTimeMillis()
+                    if (location.hasBearing() && location.bearing > 0f) {
+                        latestBearingDeg = location.bearing.roundToInt() % 360
+                    } else {
+                        latestBearingDeg = windEngine.updateGpsPosition(location.latitude, location.longitude)
+                    }
+                    if (now - lastKarooSpeedMs > 3000L && location.hasSpeed()) {
+                        val spdKmh = (location.speed * 3.6).coerceAtLeast(0.0)
+                        latestSpeedKmh = if (spdKmh < 1.0) 0.0 else spdKmh
+                    }
+                    prevGpsLocation = location
+                    appendTrackPoint(location.latitude, location.longitude)
+                }
+                @Deprecated("Deprecated in Java")
+                override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+                override fun onProviderEnabled(provider: String) {}
+                override fun onProviderDisabled(provider: String) {}
+            }
+
+            for (prov in providers) {
+                try {
+                    if (locationManager.isProviderEnabled(prov)) {
+                        locationManager.requestLocationUpdates(prov, 1000L, 0f, listener, Looper.getMainLooper())
+                    }
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {
+            gpsListening.set(false)
+        }
+    }
+
+    private fun startLoops() {
+        scope.launch {
+            while (isActive) {
+                elapsedSec += 1
+                if (recordingRide) {
+                    recordingElapsedSec += 1
+                }
+                if (demoMode) {
+                    latestPower = 248 + ((elapsedSec % 9).toInt() - 4) * 14
+                    latestHr = 161 + ((elapsedSec % 5).toInt() - 2)
+                    latestCadence = 90 + ((elapsedSec % 3).toInt() - 1)
+                    latestSpeedKmh = 34.2
+                    if (recordingRide) {
+                        latestDistanceKm += 34.2 / 3600.0
+                    }
+                    latestGradePct = 2.4
+                    latestBearingDeg = ((latestBearingDeg + 4) % 360)
+                    val rad = latestBearingDeg * PI / 180.0
+                    latestLat += (cos(rad) * 0.00009)
+                    latestLon += (sin(rad) * 0.00009)
+                    appendTrackPoint(latestLat, latestLon, force = true)
+                } else if (recordingRide && gpsActive) {
+                    appendTrackPoint(latestLat, latestLon, force = (recordingElapsedSec % 5L == 0L))
+                }
+
+                val metrics = calculator.updateOneSecondSample(
+                    powerWatts = latestPower, heartRateBpm = latestHr, cadenceRpm = latestCadence,
+                    speedKmh = latestSpeedKmh, distanceKm = latestDistanceKm, gradePercent = latestGradePct
                 )
-
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .background(
-                                if (diag.demoModeEnabled) Color(0xFFD97706) else Color(0xFF059669),
-                                RoundedCornerShape(6.dp)
-                            )
-                            .clickable { SharedTelemetryBus.setDemoMode(!diag.demoModeEnabled) }
-                            .padding(horizontal = 8.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = if (diag.demoModeEnabled) "DEMO" else "REAL",
-                            color = Color.White,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Black
-                        )
-                    }
-
-                    Box(
-                        modifier = Modifier
-                            .background(Color(0xFF1E293B), RoundedCornerShape(6.dp))
-                            .clickable { onToggleDaylight() }
-                            .padding(horizontal = 7.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = if (daylightMode) "☀️" else "🌙",
-                            fontSize = 10.sp
-                        )
+                if (metrics.powerInstant > 0) {
+                    powerSumTotal += metrics.powerInstant
+                    powerSampleCount += 1L
+                    if (metrics.powerInstant > maxPowerRecorded) {
+                        maxPowerRecorded = metrics.powerInstant
                     }
                 }
-            }
+                val computedAvgW = if (powerSampleCount > 0L) (powerSumTotal / powerSampleCount).toInt() else 0
+                val computedMaxW = maxPowerRecorded.coerceAtLeast(metrics.power3s)
 
-            // 2. CLEAN 4-TAB NAVIGATION BAR
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF0F172A))
-                    .padding(horizontal = 6.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                val tabs = listOf("1. DATOS", "2. MAPA 3D", "3. VIENTO", "4. IA PRO")
-                tabs.forEachIndexed { idx, title ->
-                    val active = currentPage == idx
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .background(
-                                if (active) Color(0xFFFACC15) else Color(0xFF1E293B),
-                                RoundedCornerShape(8.dp)
-                            )
-                            .clickable { onSelectPage(idx) }
-                            .padding(vertical = 7.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = title,
-                            color = if (active) Color(0xFF0F172A) else Color(0xFFCBD5E1),
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Black
-                        )
-                    }
-                }
-            }
-
-            // 3. MAIN PAGE CONTENT (4 UNCLUTTERED PRO SCREENS)
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-            ) {
-                when (currentPage) {
-                    0 -> EssentialRideMetricsPage(
-                        metrics = metrics,
-                        ai = ai,
-                        diag = diag,
-                        cardBg = cardBg,
-                        borderCol = borderCol,
-                        primaryText = primaryText,
-                        secondaryText = secondaryText
-                    )
-                    1 -> RealTime3DMapPage(
-                        metrics = metrics,
-                        wind = wind,
-                        diag = diag,
-                        mapZoomLevel = mapZoomLevel,
-                        onZoomIn = { onChangeZoom(mapZoomLevel + 1) },
-                        onZoomOut = { onChangeZoom(mapZoomLevel - 1) },
-                        mapStyleIndex = mapStyleIndex,
-                        onCycleMapStyle = onCycleMapStyle,
-                        is3DView = is3DView,
-                        onToggle3D = onToggle3D,
-                        tileRefreshTick = tileRefreshTick,
-                        elapsedRideSec = elapsedRideSec,
-                        cardBg = cardBg,
-                        borderCol = borderCol
-                    )
-                    2 -> CleanWindAndClimbPage(
-                        metrics = metrics,
-                        wind = wind,
-                        diag = diag,
-                        cardBg = cardBg,
-                        borderCol = borderCol,
-                        primaryText = primaryText,
-                        secondaryText = secondaryText
-                    )
-                    3 -> CleanAiCoachPage(
-                        metrics = metrics,
-                        wind = wind,
-                        ai = ai,
-                        diag = diag,
-                        carbsLogged = carbsLogged,
-                        hydrationMl = hydrationMl,
-                        onAddGel = onAddGel,
-                        onAddSip = onAddSip,
-                        cardBg = cardBg,
-                        borderCol = borderCol,
-                        primaryText = primaryText,
-                        secondaryText = secondaryText
-                    )
-                }
-            }
-
-            // 4. COMPACT HARDWARE BUTTON BAR (◀ PÁG | INICIAR RUTA / FIN STRAVA GPX | PÁG ▶)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF0B111E))
-                    .padding(horizontal = 6.dp, vertical = 5.dp),
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(
-                    modifier = Modifier
-                        .weight(0.85f)
-                        .background(Color(0xFF1E293B), RoundedCornerShape(8.dp))
-                        .clickable { onSelectPage(currentPage - 1) }
-                        .padding(vertical = 8.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "◀ PÁG",
-                        color = Color.White,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Black
-                    )
+                powerHistoryBuffer.add(metrics.power3s)
+                while (powerHistoryBuffer.size > 32) {
+                    powerHistoryBuffer.removeAt(0)
                 }
 
-                Box(
-                    modifier = Modifier
-                        .weight(1.45f)
-                        .background(
-                            if (diag.isRecordingRide) Color(0xFFDC2626) else Color(0xFF16A34A),
-                            RoundedCornerShape(8.dp)
-                        )
-                        .border(
-                            1.dp,
-                            if (diag.isRecordingRide) Color(0xFFFCA5A5) else Color(0xFF86EFAC),
-                            RoundedCornerShape(8.dp)
-                        )
-                        .clickable { onToggleRideRecording() }
-                        .padding(vertical = 8.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = if (diag.isRecordingRide) "FIN / STRAVA GPX" else "INICIAR RUTA",
-                        color = Color.White,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Black
-                    )
-                }
+                val wind = windEngine.computeWindVector(
+                    riderHeadingDeg = latestBearingDeg, riderSpeedKmh = latestSpeedKmh, cda = calculator.profile.cda
+                )
+                val ai = aiCoach.evaluate(metrics = metrics, wind = wind, profile = calculator.profile, elapsedSeconds = elapsedSec)
 
-                Box(
-                    modifier = Modifier
-                        .weight(0.85f)
-                        .background(Color(0xFF1E293B), RoundedCornerShape(8.dp))
-                        .clickable { onSelectPage(currentPage + 1) }
-                        .padding(vertical = 8.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "PÁG ▶",
-                        color = Color(0xFFFACC15),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Black
-                    )
+                val efValue = if (metrics.heartRateBpm > 60) {
+                    ((metrics.normalizedPower.toDouble() / metrics.heartRateBpm.toDouble()) * 100.0).roundToInt() / 100.0
+                } else {
+                    1.58
                 }
+                val netDepletionWatts = (metrics.power3s - calculator.profile.ftpWatts).coerceAtLeast(0)
+                val tteMins = if (netDepletionWatts > 5) {
+                    ((metrics.wPrimeBalanceKj * 1000.0) / netDepletionWatts.toDouble() / 60.0).roundToInt().coerceIn(1, 90)
+                } else {
+                    99
+                }
+                val glycogenPct = (100.0 - (metrics.kilojoulesTotal / 24.0)).roundToInt().coerceIn(5, 100)
+
+                diagnostics = LiveSensorDiagnostics(
+                    karooServiceConnected = karooConnected, gpsFixActive = gpsActive, barometerActive = baroActive,
+                    altitudeMeters = (baroAltitudeMeters * 10.0).roundToInt() / 10.0, pressureHpa = baroPressureHpa,
+                    activeStreamsCount = 4, demoModeEnabled = demoMode,
+                    latitude = latestLat, longitude = latestLon, bearingDeg = latestBearingDeg,
+                    gpsAccuracyMeters = latestGpsAccuracyM, trackPoints = trackHistory.toList(),
+                    isRecordingRide = recordingRide,
+                    recordingElapsedSeconds = recordingElapsedSec,
+                    recordedTrackPointsCount = recordedRidePoints.size,
+                    lastExportedGpxPath = lastExportedGpxFile,
+                    powerHistory30s = powerHistoryBuffer.toList(),
+                    avgPowerWatts = computedAvgW,
+                    maxPowerWatts = computedMaxW,
+                    efficiencyFactor = efValue,
+                    timeToExhaustionMinutes = tteMins,
+                    glycogenRemainingPct = glycogenPct
+                )
+                snapshot = Triple(metrics, wind, ai)
+                delay(1000L)
             }
         }
     }
-}
 
-private fun garminZoneColor(zone: Int): Color = when (zone) {
-    1 -> Color(0xFF94A3B8)
-    2 -> Color(0xFF3B82F6)
-    3 -> Color(0xFF10B981)
-    4 -> Color(0xFFFACC15)
-    5 -> Color(0xFFF97316)
-    6 -> Color(0xFFEF4444)
-    else -> Color(0xFFA855F7)
-}
-
-@Composable
-private fun EssentialRideMetricsPage(
-    metrics: CyclingMetricsSnapshot,
-    ai: AiHeuristicEvaluation,
-    diag: LiveSensorDiagnostics,
-    cardBg: Color,
-    borderCol: Color,
-    primaryText: Color,
-    secondaryText: Color
-) {
-    val activeZoneCol = garminZoneColor(metrics.powerZone)
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(6.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1.42f)
-                .background(cardBg, RoundedCornerShape(12.dp))
-                .border(2.dp, activeZoneCol, RoundedCornerShape(12.dp))
-                .padding(horizontal = 10.dp, vertical = 7.dp),
-            verticalArrangement = Arrangement.SpaceBetween
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .background(activeZoneCol, RoundedCornerShape(5.dp))
-                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = "Z${metrics.powerZone}",
-                            color = Color(0xFF0F172A),
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Black
-                        )
-                    }
-                    Text(
-                        text = "${metrics.powerZoneName.uppercase()} • ${metrics.ftpPercent}% FTP",
-                        color = activeZoneCol,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Black
-                    )
-                }
-
-                Text(
-                    text = "META IA ${ai.adaptiveTargetWatts}W",
-                    color = Color(0xFF38BDF8),
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Black
-                )
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Box(
-                    modifier = Modifier
-                        .width(126.dp)
-                        .fillMaxHeight(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Canvas(modifier = Modifier.size(118.dp, 78.dp)) {
-                        val arcDiameter = size.width * 0.88f
-                        val arcTopLeft = Offset((size.width - arcDiameter) / 2f, 8f)
-                        val arcSize = Size(arcDiameter, arcDiameter)
-                        val strokeW = 13f
-
-                        val zoneSpans = listOf(
-                            26f to Color(0xFF94A3B8),
-                            30f to Color(0xFF3B82F6),
-                            26f to Color(0xFF10B981),
-                            26f to Color(0xFFFACC15),
-                            24f to Color(0xFFF97316),
-                            24f to Color(0xFFEF4444),
-                            20f to Color(0xFFA855F7)
-                        )
-                        var startAng = 180f
-                        zoneSpans.forEachIndexed { idx, (sweep, col) ->
-                            val isCurrent = (idx + 1) == metrics.powerZone
-                            drawArc(
-                                color = if (isCurrent) col else col.copy(alpha = 0.30f),
-                                startAngle = startAng,
-                                sweepAngle = sweep - 1.5f,
-                                useCenter = false,
-                                topLeft = arcTopLeft,
-                                size = arcSize,
-                                style = Stroke(width = if (isCurrent) strokeW + 4f else strokeW, cap = StrokeCap.Butt)
-                            )
-                            startAng += sweep
-                        }
-
-                        val cx = size.width / 2f
-                        val cy = 8f + arcDiameter / 2f
-                        val radius = arcDiameter / 2f
-
-                        val targetRatio = (ai.adaptiveTargetWatts / 420f).coerceIn(0f, 1f)
-                        val targetRad = (180.0 + targetRatio * 180.0) * PI / 180.0
-                        val tx = cx + (radius * cos(targetRad)).toFloat()
-                        val ty = cy + (radius * sin(targetRad)).toFloat()
-                        drawCircle(Color(0xFF38BDF8), radius = 5.5f, center = Offset(tx, ty))
-
-                        val powerRatio = (metrics.power3s / 420f).coerceIn(0f, 1f)
-                        val needleRad = (180.0 + powerRatio * 180.0) * PI / 180.0
-                        val nx = cx + ((radius - 6f) * cos(needleRad)).toFloat()
-                        val ny = cy + ((radius - 6f) * sin(needleRad)).toFloat()
-                        drawLine(
-                            color = activeZoneCol,
-                            start = Offset(cx, cy),
-                            end = Offset(nx, ny),
-                            strokeWidth = 5f,
-                            cap = StrokeCap.Round
-                        )
-                        drawCircle(Color.White, radius = 6f, center = Offset(cx, cy))
-                    }
-
-                    Row(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(bottom = 1.dp),
-                        verticalAlignment = Alignment.Bottom
-                    ) {
-                        Text(
-                            text = "${metrics.power3s}",
-                            color = primaryText,
-                            fontSize = 34.sp,
-                            fontWeight = FontWeight.Black
-                        )
-                        Text(
-                            text = "W",
-                            color = activeZoneCol,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Black,
-                            modifier = Modifier.padding(bottom = 4.dp, start = 2.dp)
-                        )
-                    }
-                }
-
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                        .padding(start = 6.dp),
-                    verticalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Canvas(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                            .padding(top = 4.dp, bottom = 2.dp)
-                    ) {
-                        val w = size.width
-                        val h = size.height
-                        val history = if (diag.powerHistory30s.isNotEmpty()) {
-                            diag.powerHistory30s.takeLast(24)
-                        } else {
-                            List(24) { metrics.power3s }
-                        }
-
-                        val ftpY = h - ((280f / 450f).coerceIn(0.1f, 0.95f) * h)
-                        drawLine(
-                            color = Color(0x66FACC15),
-                            start = Offset(0f, ftpY),
-                            end = Offset(w, ftpY),
-                            strokeWidth = 1.5f
-                        )
-
-                        val count = history.size.coerceAtLeast(1)
-                        val gap = 2.5f
-                        val barW = ((w - gap * (count - 1)) / count).coerceAtLeast(3f)
-
-                        history.forEachIndexed { i, watts ->
-                            val ratio = (watts / 450f).coerceIn(0.06f, 1f)
-                            val barH = ratio * h
-                            val pctFtp = (watts * 100) / 280
-                            val barZone = when {
-                                pctFtp < 55 -> 1
-                                pctFtp < 75 -> 2
-                                pctFtp < 90 -> 3
-                                pctFtp < 105 -> 4
-                                pctFtp < 120 -> 5
-                                pctFtp < 150 -> 6
-                                else -> 7
-                            }
-                            val bCol = garminZoneColor(barZone)
-                            val left = i * (barW + gap)
-                            drawRect(
-                                color = bCol,
-                                topLeft = Offset(left, h - barH),
-                                size = Size(barW, barH)
-                            )
-                        }
-                    }
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFF0B111E), RoundedCornerShape(5.dp))
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "AVG ${diag.avgPowerWatts}W",
-                            color = Color(0xFF10B981),
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Black
-                        )
-                        Text(
-                            text = "MAX ${diag.maxPowerWatts}W",
-                            color = Color(0xFFF97316),
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Black
-                        )
-                        Text(
-                            text = "NP ${metrics.normalizedPower}W",
-                            color = Color(0xFF38BDF8),
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Black
-                        )
-                    }
-                }
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(6.dp),
-                horizontalArrangement = Arrangement.spacedBy(3.dp)
-            ) {
-                for (z in 1..7) {
-                    val col = garminZoneColor(z)
-                    val active = z == metrics.powerZone
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight()
-                            .background(
-                                if (active) col else col.copy(alpha = 0.22f),
-                                RoundedCornerShape(3.dp)
-                            )
-                    )
-                }
-            }
-        }
-
-        Row(modifier = Modifier.fillMaxWidth().weight(0.95f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            BigMetricCard(
-                modifier = Modifier.weight(1f).fillMaxHeight(),
-                label = "VELOCIDAD",
-                mainValue = "${metrics.speedKmh}",
-                unit = "km/h",
-                subLabel = "Dist: ${metrics.distanceKm} km",
-                accentColor = Color(0xFF10B981),
-                cardBg = cardBg, borderCol = borderCol, primaryText = primaryText, secondaryText = secondaryText
-            )
-            BigMetricCard(
-                modifier = Modifier.weight(1f).fillMaxHeight(),
-                label = "PULSO (Z${metrics.hrZone})",
-                mainValue = "${metrics.heartRateBpm}",
-                unit = "bpm",
-                subLabel = if (metrics.heartRateBpm > 0) "Activo ANT+/BLE" else "Sin pulsómetro",
-                accentColor = Color(0xFFF43F5E),
-                cardBg = cardBg, borderCol = borderCol, primaryText = primaryText, secondaryText = secondaryText
-            )
-        }
-
-        Row(modifier = Modifier.fillMaxWidth().weight(0.95f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            BigMetricCard(
-                modifier = Modifier.weight(1f).fillMaxHeight(),
-                label = "CADENCIA",
-                mainValue = "${metrics.cadenceRpm}",
-                unit = "rpm",
-                subLabel = "Pedaleo",
-                accentColor = Color(0xFF38BDF8),
-                cardBg = cardBg, borderCol = borderCol, primaryText = primaryText, secondaryText = secondaryText
-            )
-            BigMetricCard(
-                modifier = Modifier.weight(1f).fillMaxHeight(),
-                label = "PENDIENTE",
-                mainValue = "${metrics.gradePercent}",
-                unit = "%",
-                subLabel = "Alt: ${diag.altitudeMeters.toInt()} m",
-                accentColor = Color(0xFFF59E0B),
-                cardBg = cardBg, borderCol = borderCol, primaryText = primaryText, secondaryText = secondaryText
-            )
-        }
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(cardBg, RoundedCornerShape(10.dp))
-                .border(1.dp, borderCol, RoundedCornerShape(10.dp))
-                .padding(horizontal = 10.dp, vertical = 7.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            CompactStatItem(
-                label = "STRAVA GPX",
-                value = if (diag.isRecordingRide) "${diag.recordedTrackPointsCount} pts" else "LISTO",
-                valueColor = if (diag.isRecordingRide) Color(0xFFF87171) else Color(0xFF34D399),
-                labelColor = secondaryText
-            )
-            CompactStatItem("W' RESERVA", "${metrics.wPrimePercent}% (${metrics.wPrimeBalanceKj}kJ)", Color(0xFFA855F7), secondaryText)
-            CompactStatItem("CARGA TSS", "${metrics.tss}", Color(0xFFFACC15), secondaryText)
-        }
-    }
-}
-
-@Composable
-private fun RealTime3DMapPage(
-    metrics: CyclingMetricsSnapshot,
-    wind: WindVectorReport,
-    diag: LiveSensorDiagnostics,
-    mapZoomLevel: Int,
-    onZoomIn: () -> Unit,
-    onZoomOut: () -> Unit,
-    mapStyleIndex: Int,
-    onCycleMapStyle: () -> Unit,
-    is3DView: Boolean,
-    onToggle3D: () -> Unit,
-    tileRefreshTick: Int,
-    elapsedRideSec: Int,
-    cardBg: Color,
-    borderCol: Color
-) {
-    val latStr = String.format(Locale.US, "%.5f", diag.latitude)
-    val lonStr = String.format(Locale.US, "%.5f", diag.longitude)
-    val styleNames = listOf("🗺️ Mapa", "🛰️ Satélite", "⛰️ Topo")
-
-    Column(
-        modifier = Modifier.fillMaxSize().padding(6.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp)
-    ) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .background(Color(0xFF06101E), RoundedCornerShape(12.dp))
-                .border(2.dp, Color(0xFF1E293B), RoundedCornerShape(12.dp))
-                .clipToBounds()
-        ) {
-            val n = (1 shl mapZoomLevel).toDouble()
-            val safeLat = diag.latitude.coerceIn(-85.0, 85.0)
-            val latRad = safeLat * PI / 180.0
-            val exactTileX = (diag.longitude + 180.0) / 360.0 * n
-            val exactTileY = (1.0 - ln(tan(latRad) + 1.0 / cos(latRad)) / PI) / 2.0 * n
-            val centerTileX = floor(exactTileX).toInt()
-            val centerTileY = floor(exactTileY).toInt()
-            val offsetPxX = ((exactTileX - centerTileX) * 256.0).toFloat()
-            val offsetPxY = ((exactTileY - centerTileY) * 256.0).toFloat()
-            val mapRotationDeg = -wind.riderHeadingDeg.toFloat()
-
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(Color(0xFF0B192C), Color(0xFF0F2942), Color(0xFF07111E))
-                    ),
-                    size = Size(size.width, size.height)
-                )
-            }
-
-            Canvas(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer {
-                        rotationX = if (is3DView) 52f else 0f
-                        scaleX = if (is3DView) 1.35f else 1.0f
-                        scaleY = if (is3DView) 1.35f else 1.0f
-                        cameraDistance = 14f * density
-                    }
-            ) {
-                val ignoredTick = tileRefreshTick
-                val cx = size.width / 2f
-                val cy = size.height * 0.56f
-
-                rotate(degrees = mapRotationDeg, pivot = Offset(cx, cy)) {
-                    val baseLeft = cx - offsetPxX
-                    val baseTop = cy - offsetPxY
-
-                    for (dy in -2..2) {
-                        for (dx in -2..2) {
-                            val tileLeft = baseLeft + dx * 256f
-                            val tileTop = baseTop + dy * 256f
-                            val bmp = LiveTileMapEngine.getOrFetchTile(
-                                styleIndex = mapStyleIndex,
-                                z = mapZoomLevel,
-                                x = centerTileX + dx,
-                                y = centerTileY + dy
-                            )
-                            if (bmp != null) {
-                                drawImage(image = bmp, topLeft = Offset(tileLeft, tileTop))
-                            } else {
-                                val checker = ((centerTileX + dx + centerTileY + dy) % 2 == 0)
-                                drawRect(
-                                    color = if (checker) Color(0xFF0D1B2A) else Color(0xFF112233),
-                                    topLeft = Offset(tileLeft, tileTop),
-                                    size = Size(256f, 256f)
-                                )
-                                val step = 64f
-                                for (g in 0..3) {
-                                    val gx = tileLeft + g * step
-                                    val gy = tileTop + g * step
-                                    drawLine(Color(0xFF1E3A5F), Offset(gx, tileTop), Offset(gx, tileTop + 256f), strokeWidth = 2f)
-                                    drawLine(Color(0xFF1E3A5F), Offset(tileLeft, gy), Offset(tileLeft + 256f, gy), strokeWidth = 2f)
-                                }
-                            }
-                        }
-                    }
-
-                    drawCircle(Color(0x6638BDF8), radius = 65f, center = Offset(cx, cy), style = Stroke(width = 2.5f))
-                    drawCircle(Color(0x552DD4BF), radius = 135f, center = Offset(cx, cy), style = Stroke(width = 2.5f))
-                    drawCircle(Color(0x4494A3B8), radius = 210f, center = Offset(cx, cy), style = Stroke(width = 2f))
-
-                    drawLine(Color(0x88EF4444), Offset(cx, cy), Offset(cx, cy - 220f), strokeWidth = 3.5f)
-                    drawLine(Color(0x5564748B), Offset(cx, cy), Offset(cx, cy + 220f), strokeWidth = 2f)
-                    drawLine(Color(0x5564748B), Offset(cx - 220f, cy), Offset(cx + 220f, cy), strokeWidth = 2f)
-
-                    val windRad = (wind.trueWindDirectionDeg + 180) * PI / 180.0
-                    val windDx = sin(windRad).toFloat()
-                    val windDy = -cos(windRad).toFloat()
-                    val perpX = -windDy
-                    val perpY = windDx
-                    val windArrowColor = when {
-                        wind.headwindKmh >= 8.0 -> Color(0xEEFB923C)
-                        wind.headwindKmh <= -5.0 -> Color(0xEE34D399)
-                        else -> Color(0xEE2DD4BF)
-                    }
-                    val phase = ((elapsedRideSec % 8) / 8f) * 76f
-                    for (r in -2..2) {
-                        for (c in -2..2) {
-                            val sx = cx + c * 92f + windDx * (phase - 38f)
-                            val sy = cy + r * 92f + windDy * (phase - 38f)
-                            val ex = sx + windDx * 38f
-                            val ey = sy + windDy * 38f
-
-                            drawLine(
-                                color = windArrowColor,
-                                start = Offset(sx, sy),
-                                end = Offset(ex, ey),
-                                strokeWidth = 4f,
-                                cap = StrokeCap.Round
-                            )
-                            val headBaseX = ex - windDx * 11f
-                            val headBaseY = ey - windDy * 11f
-                            val arrowHead = Path().apply {
-                                moveTo(ex, ey)
-                                lineTo(headBaseX + perpX * 6.5f, headBaseY + perpY * 6.5f)
-                                lineTo(headBaseX - perpX * 6.5f, headBaseY - perpY * 6.5f)
-                                close()
-                            }
-                            drawPath(arrowHead, windArrowColor)
-                        }
-                    }
-
-                    val pts = diag.trackPoints
-                    if (pts.size >= 2) {
-                        for (i in 0 until pts.size - 1) {
-                            val p1 = pts[i]
-                            val p2 = pts[i + 1]
-                            val p1LatRad = p1.lat.coerceIn(-85.0, 85.0) * PI / 180.0
-                            val p2LatRad = p2.lat.coerceIn(-85.0, 85.0) * PI / 180.0
-                            val p1Tx = (p1.lon + 180.0) / 360.0 * n
-                            val p1Ty = (1.0 - ln(tan(p1LatRad) + 1.0 / cos(p1LatRad)) / PI) / 2.0 * n
-                            val p2Tx = (p2.lon + 180.0) / 360.0 * n
-                            val p2Ty = (1.0 - ln(tan(p2LatRad) + 1.0 / cos(p2LatRad)) / PI) / 2.0 * n
-                            val x1 = cx + ((p1Tx - exactTileX) * 256.0).toFloat()
-                            val y1 = cy + ((p1Ty - exactTileY) * 256.0).toFloat()
-                            val x2 = cx + ((p2Tx - exactTileX) * 256.0).toFloat()
-                            val y2 = cy + ((p2Ty - exactTileY) * 256.0).toFloat()
-
-                            drawLine(Color(0xCC020617), Offset(x1, y1 + 5f), Offset(x2, y2 + 5f), strokeWidth = 14f)
-                            val segColor = when {
-                                p2.headwindKmh >= 8.0 -> Color(0xFFF97316)
-                                p2.headwindKmh <= -5.0 -> Color(0xFF10B981)
-                                else -> Color(0xFF38BDF8)
-                            }
-                            drawLine(segColor, Offset(x1, y1), Offset(x2, y2), strokeWidth = 8f)
-                        }
-                    }
-                }
-
-                val corridorColor = when {
-                    wind.headwindKmh >= 8.0 -> Color(0xFFF97316)
-                    wind.headwindKmh <= -5.0 -> Color(0xFF10B981)
-                    else -> Color(0xFF38BDF8)
-                }
-                val corridorPath = Path().apply {
-                    moveTo(cx - 26f, cy)
-                    lineTo(cx - 8f, cy - 190f)
-                    lineTo(cx + 8f, cy - 190f)
-                    lineTo(cx + 26f, cy)
-                    close()
-                }
-                drawPath(corridorPath, corridorColor.copy(alpha = 0.28f))
-                drawLine(corridorColor, Offset(cx, cy), Offset(cx, cy - 185f), strokeWidth = 6f)
-
-                drawCircle(Color(0x44FACC15), radius = 34f, center = Offset(cx, cy))
-
-                val shadowPath = Path().apply {
-                    moveTo(cx, cy - 16f)
-                    lineTo(cx + 18f, cy + 20f)
-                    lineTo(cx, cy + 11f)
-                    lineTo(cx - 18f, cy + 20f)
-                    close()
-                }
-                drawPath(shadowPath, Color(0xBB000000))
-
-                val chevronPath = Path().apply {
-                    moveTo(cx, cy - 22f)
-                    lineTo(cx + 18f, cy + 14f)
-                    lineTo(cx, cy + 5f)
-                    lineTo(cx - 18f, cy + 14f)
-                    close()
-                }
-                drawPath(chevronPath, Color(0xFFFACC15))
-                drawPath(chevronPath, Color(0xFF0F172A), style = Stroke(width = 3f))
-
-                val relWindFlowRad = (wind.relativeWindAngleDeg + 90) * PI / 180.0
-                val rwStartDist = 66f
-                val rwEndDist = 30f
-                val rwx1 = cx + (rwStartDist * cos(relWindFlowRad)).toFloat()
-                val rwy1 = cy + (rwStartDist * sin(relWindFlowRad)).toFloat()
-                val rwx2 = cx + (rwEndDist * cos(relWindFlowRad)).toFloat()
-                val rwy2 = cy + (rwEndDist * sin(relWindFlowRad)).toFloat()
-                drawLine(
-                    color = Color(0xFF2DD4BF),
-                    start = Offset(rwx1, rwy1),
-                    end = Offset(rwx2, rwy2),
-                    strokeWidth = 5f,
-                    cap = StrokeCap.Round
-                )
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .align(Alignment.TopCenter)
-                    .padding(6.dp)
-                    .background(Color(0xDD0B111E), RoundedCornerShape(10.dp))
-                    .border(1.dp, Color(0xFF334155), RoundedCornerShape(10.dp))
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column {
-                    Text("$latStr°, $lonStr°", color = Color(0xFFFACC15), fontSize = 11.sp, fontWeight = FontWeight.Black)
-                    Text("Rumbo ${wind.riderHeadingDeg}° • Viento ${abs(wind.headwindKmh)} km/h (${wind.relativeWindAngleDeg}°)", color = Color(0xFF2DD4BF), fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                }
-                Text("Z$mapZoomLevel", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Black)
-            }
-
-            Column(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 56.dp, end = 8.dp)
-                    .background(Color(0xE60B111E), RoundedCornerShape(12.dp))
-                    .border(1.5.dp, Color(0xFF14B8A6), RoundedCornerShape(12.dp))
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(
-                    text = "VIENTO",
-                    color = Color(0xFF94A3B8),
-                    fontSize = 8.sp,
-                    fontWeight = FontWeight.Black
-                )
-                Canvas(modifier = Modifier.size(44.dp)) {
-                    val wcx = size.width / 2f
-                    val wcy = size.height / 2f
-                    val wr = size.minDimension * 0.42f
-                    drawCircle(Color(0xFF1E293B), radius = wr, center = Offset(wcx, wcy), style = Stroke(width = 2.5f))
-
-                    val rad = (wind.relativeWindAngleDeg - 90) * PI / 180.0
-                    val sx = wcx + (wr * cos(rad)).toFloat()
-                    val sy = wcy + (wr * sin(rad)).toFloat()
-                    val ex = wcx - (wr * 0.65f * cos(rad)).toFloat()
-                    val ey = wcy - (wr * 0.65f * sin(rad)).toFloat()
-                    val windCol = if (wind.headwindKmh >= 0) Color(0xFFF97316) else Color(0xFF10B981)
-                    drawLine(windCol, Offset(sx, sy), Offset(ex, ey), strokeWidth = 4f, cap = StrokeCap.Round)
-                    drawCircle(Color(0xFFFACC15), radius = 4f, center = Offset(wcx, wcy))
-                }
-                Text(
-                    text = "${wind.trueWindSpeedKmh} km/h",
-                    color = Color(0xFF2DD4BF),
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Black
-                )
-                Text(
-                    text = if (wind.headwindKmh >= 0) "CONTRA ${wind.relativeWindAngleDeg}°" else "FAVOR ${wind.relativeWindAngleDeg}°",
-                    color = if (wind.headwindKmh >= 0) Color(0xFFF97316) else Color(0xFF10B981),
-                    fontSize = 8.sp,
-                    fontWeight = FontWeight.Black
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(6.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                    MapControlButton("Z+", onClick = onZoomIn)
-                    MapControlButton("Z−", onClick = onZoomOut)
-                    MapControlButton(if (is3DView) "3D 52°" else "2D", active = is3DView, onClick = onToggle3D)
-                }
-                MapControlButton(styleNames[mapStyleIndex], active = true, onClick = onCycleMapStyle)
-            }
-        }
-
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            CompactMapTile(Modifier.weight(1f), "POTENCIA 3S", "${metrics.power3s}W", Color(0xFFFACC15), cardBg, borderCol)
-            CompactMapTile(Modifier.weight(1f), "VELOCIDAD", "${metrics.speedKmh} km/h", Color(0xFF10B981), cardBg, borderCol)
-            CompactMapTile(Modifier.weight(1f), "PENDIENTE", "${metrics.gradePercent}%", Color(0xFFF59E0B), cardBg, borderCol)
-        }
-    }
-}
-
-@Composable
-private fun CleanWindAndClimbPage(
-    metrics: CyclingMetricsSnapshot,
-    wind: WindVectorReport,
-    diag: LiveSensorDiagnostics,
-    cardBg: Color,
-    borderCol: Color,
-    primaryText: Color,
-    secondaryText: Color
-) {
-    Column(
-        modifier = Modifier.fillMaxSize().padding(6.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1.3f)
-                .background(cardBg, RoundedCornerShape(12.dp))
-                .border(1.dp, borderCol, RoundedCornerShape(12.dp))
-                .padding(8.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Canvas(modifier = Modifier.size(150.dp)) {
-                val cx = size.width / 2f
-                val cy = size.height / 2f
-                val r = size.minDimension * 0.42f
-                drawCircle(Color(0xFF1E293B), radius = r, center = Offset(cx, cy), style = Stroke(width = 4f))
-                drawCircle(Color(0x332DD4BF), radius = r * 0.65f, center = Offset(cx, cy), style = Stroke(width = 2f))
-                val rad = (wind.relativeWindAngleDeg - 90) * PI / 180.0
-                val tipX = cx + (r * cos(rad)).toFloat()
-                val tipY = cy + (r * sin(rad)).toFloat()
-                drawLine(Color(0xFF2DD4BF), Offset(cx, cy), Offset(tipX, tipY), strokeWidth = 8f)
-                drawCircle(Color(0xFFFACC15), radius = 9f, center = Offset(cx, cy))
-            }
-            Column(modifier = Modifier.align(Alignment.TopStart)) {
-                Text("VIENTO RELATIVO", color = secondaryText, fontSize = 10.sp, fontWeight = FontWeight.Black)
-                Text("${wind.relativeWindAngleDeg}°", color = Color(0xFF2DD4BF), fontSize = 20.sp, fontWeight = FontWeight.Black)
-            }
-            Column(modifier = Modifier.align(Alignment.TopEnd), horizontalAlignment = Alignment.End) {
-                Text("CLIMA LOCAL", color = secondaryText, fontSize = 10.sp, fontWeight = FontWeight.Black)
-                Text("${wind.temperatureC}°C • ${wind.humidityPct}%", color = primaryText, fontSize = 14.sp, fontWeight = FontWeight.Black)
-            }
-        }
-
-        Row(modifier = Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            val isHead = wind.headwindKmh >= 0
-            BigMetricCard(
-                modifier = Modifier.weight(1f).fillMaxHeight(),
-                label = if (isHead) "VIENTO EN CONTRA" else "VIENTO A FAVOR",
-                mainValue = "${abs(wind.headwindKmh)}",
-                unit = "km/h",
-                subLabel = "Aero: ${if (wind.aeroPowerImpactWatts >= 0) "+" else ""}${wind.aeroPowerImpactWatts}W",
-                accentColor = if (isHead) Color(0xFFF97316) else Color(0xFF10B981),
-                cardBg = cardBg, borderCol = borderCol, primaryText = primaryText, secondaryText = secondaryText
-            )
-            BigMetricCard(
-                modifier = Modifier.weight(1f).fillMaxHeight(),
-                label = "VIENTO LATERAL",
-                mainValue = "${abs(wind.crosswindKmh)}",
-                unit = "km/h",
-                subLabel = "Ráfagas: ${wind.windGustsKmh} km/h",
-                accentColor = Color(0xFF38BDF8),
-                cardBg = cardBg, borderCol = borderCol, primaryText = primaryText, secondaryText = secondaryText
-            )
-        }
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(cardBg, RoundedCornerShape(10.dp))
-                .border(1.dp, borderCol, RoundedCornerShape(10.dp))
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            CompactStatItem("ALTITUD REAL", "${diag.altitudeMeters.toInt()} m", Color(0xFFFACC15), secondaryText)
-            CompactStatItem("VAM ESCALADA", "${metrics.vamMetersPerHour} m/h", Color(0xFF10B981), secondaryText)
-            CompactStatItem("BARÓMETRO", "${diag.pressureHpa} hPa", Color(0xFF38BDF8), secondaryText)
-        }
-    }
-}
-
-@Composable
-private fun CleanAiCoachPage(
-    metrics: CyclingMetricsSnapshot,
-    wind: WindVectorReport,
-    ai: AiHeuristicEvaluation,
-    diag: LiveSensorDiagnostics,
-    carbsLogged: Int,
-    hydrationMl: Int,
-    onAddGel: () -> Unit,
-    onAddSip: () -> Unit,
-    cardBg: Color,
-    borderCol: Color,
-    primaryText: Color,
-    secondaryText: Color
-) {
-    val powerDiff = metrics.power3s - ai.adaptiveTargetWatts
-    val pacingActionText = when {
-        powerDiff > 18 -> "BAJA ${powerDiff}W (SOBRE-ESFUERZO)"
-        powerDiff < -18 -> "SUBE ${abs(powerDiff)}W (SUB-RITMO)"
-        else -> "RITMO ÓPTIMO (±${abs(powerDiff)}W)"
-    }
-    val pacingColor = when {
-        powerDiff > 18 -> Color(0xFFF97316)
-        powerDiff < -18 -> Color(0xFF38BDF8)
-        else -> Color(0xFF10B981)
-    }
-    val tteLabel = if (diag.timeToExhaustionMinutes >= 90) {
-        "SOSTENIBLE (RECARGANDO W')"
-    } else {
-        "AGOTAMIENTO EN ${diag.timeToExhaustionMinutes} MIN"
-    }
-    val decouplingStatus = if (metrics.aerobicDecouplingPercent <= 5.0) "BASE SÓLIDA (<5%)" else "FATIGA CARDÍACA (>5%)"
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(6.dp),
-        verticalArrangement = Arrangement.spacedBy(5.dp)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF172554), RoundedCornerShape(10.dp))
-                .border(2.dp, pacingColor, RoundedCornerShape(10.dp))
-                .padding(horizontal = 10.dp, vertical = 7.dp),
-            verticalArrangement = Arrangement.spacedBy(2.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "1. PACING HEURÍSTICO (VIENTO + PENDIENTE)",
-                    color = Color(0xFF93C5FD),
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Black
-                )
-                Text(
-                    text = pacingActionText,
-                    color = pacingColor,
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Black
-                )
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.Bottom
-            ) {
-                Text(
-                    text = "Meta IA: ${ai.adaptiveTargetWatts}W  (Actual: ${metrics.power3s}W)",
-                    color = Color.White,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.Black
-                )
-                Text(
-                    text = "Aero ${if (wind.aeroPowerImpactWatts >= 0) "+" else ""}${wind.aeroPowerImpactWatts}W • ${metrics.gradePercent}%",
-                    color = Color(0xFFFACC15),
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Black
-                )
-            }
-            Text(
-                text = "Cálculo: Compensa arrastre de viento (${abs(wind.headwindKmh)} km/h) y rampa para no quemar W'.",
-                color = Color(0xFFDBEAFE),
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Medium
-            )
-        }
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight()
-                    .background(cardBg, RoundedCornerShape(10.dp))
-                    .border(1.dp, borderCol, RoundedCornerShape(10.dp))
-                    .padding(8.dp),
-                verticalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = "2. AUTONOMÍA W' (TTE)",
-                    color = secondaryText,
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Black
-                )
-                Row(verticalAlignment = Alignment.Bottom) {
-                    Text(
-                        text = if (diag.timeToExhaustionMinutes >= 90) "∞" else "${diag.timeToExhaustionMinutes}m",
-                        color = Color(0xFFA855F7),
-                        fontSize = 26.sp,
-                        fontWeight = FontWeight.Black
-                    )
-                    Text(
-                        text = " • ${metrics.wPrimePercent}%",
-                        color = primaryText,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Black,
-                        modifier = Modifier.padding(bottom = 3.dp)
-                    )
-                }
-                Text(
-                    text = tteLabel,
-                    color = if (diag.timeToExhaustionMinutes < 15) Color(0xFFEF4444) else Color(0xFF10B981),
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Black
-                )
-                Text(
-                    text = "Reserva Skiba: ${metrics.wPrimeBalanceKj} kJ",
-                    color = secondaryText,
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight()
-                    .background(cardBg, RoundedCornerShape(10.dp))
-                    .border(1.dp, borderCol, RoundedCornerShape(10.dp))
-                    .padding(8.dp),
-                verticalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = "3. EFICIENCIA (NP/FC)",
-                    color = secondaryText,
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Black
-                )
-                Row(verticalAlignment = Alignment.Bottom) {
-                    Text(
-                        text = "${diag.efficiencyFactor}",
-                        color = Color(0xFF38BDF8),
-                        fontSize = 26.sp,
-                        fontWeight = FontWeight.Black
-                    )
-                    Text(
-                        text = " W/bpm",
-                        color = primaryText,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(bottom = 3.dp)
-                    )
-                }
-                Text(
-                    text = decouplingStatus,
-                    color = if (metrics.aerobicDecouplingPercent <= 5.0) Color(0xFF10B981) else Color(0xFFF59E0B),
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Black
-                )
-                Text(
-                    text = "Deriva Pa:Hr: ${metrics.aerobicDecouplingPercent}%",
-                    color = secondaryText,
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-        }
-
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1.05f)
-                .background(cardBg, RoundedCornerShape(10.dp))
-                .border(1.dp, borderCol, RoundedCornerShape(10.dp))
-                .padding(8.dp),
-            verticalArrangement = Arrangement.SpaceBetween
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "4. BALANCE METABÓLICO (${metrics.kilojoulesTotal.toInt()} kJ QUEMADOS)",
-                    color = secondaryText,
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Black
-                )
-                Text(
-                    text = "GLUCÓGENO ${diag.glycogenRemainingPct}% • PÁJARA ${ai.bonkRiskPercent}%",
-                    color = if (ai.bonkRiskPercent >= 50) Color(0xFFEF4444) else Color(0xFF10B981),
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Black
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(3.dp)
-                ) {
-                    Text(
-                        text = "Meta: ${ai.recommendedCarbsGramsPerHour}g/h • Gel en ${ai.nextCarbIntakeMinutes}m (${carbsLogged}g)",
-                        color = primaryText,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.ExtraBold
-                    )
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFFD97706), RoundedCornerShape(7.dp))
-                            .clickable { onAddGel() }
-                            .padding(vertical = 8.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text("+25g GEL CONSUMIDO", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Black)
-                    }
-                }
-
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(3.dp)
-                ) {
-                    Text(
-                        text = "Sudor: ${ai.recommendedHydrationMlPerHour}ml/h • Agua ${ai.nextHydrationMinutes}m (${hydrationMl}ml)",
-                        color = primaryText,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.ExtraBold
-                    )
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFF0284C7), RoundedCornerShape(7.dp))
-                            .clickable { onAddSip() }
-                            .padding(vertical = 8.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text("+150ml AGUA BEBIDA", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Black)
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun BigMetricCard(
-    modifier: Modifier = Modifier,
-    label: String,
-    mainValue: String,
-    unit: String,
-    subLabel: String,
-    accentColor: Color,
-    cardBg: Color,
-    borderCol: Color,
-    primaryText: Color,
-    secondaryText: Color
-) {
-    Column(
-        modifier = modifier
-            .background(cardBg, RoundedCornerShape(12.dp))
-            .border(1.dp, borderCol, RoundedCornerShape(12.dp))
-            .padding(horizontal = 10.dp, vertical = 8.dp),
-        verticalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(text = label, color = secondaryText, fontSize = 11.sp, fontWeight = FontWeight.Black)
-        Row(verticalAlignment = Alignment.Bottom) {
-            Text(text = mainValue, color = accentColor, fontSize = 30.sp, fontWeight = FontWeight.Black)
-            Text(text = " $unit", color = primaryText, fontSize = 13.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 4.dp))
-        }
-        Text(text = subLabel, color = secondaryText, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-    }
-}
-
-@Composable
-private fun CompactStatItem(label: String, value: String, valueColor: Color, labelColor: Color) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(text = label, color = labelColor, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold)
-        Text(text = value, color = valueColor, fontSize = 15.sp, fontWeight = FontWeight.Black)
-    }
-}
-
-@Composable
-private fun MapControlButton(text: String, active: Boolean = false, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .background(if (active) Color(0xFF2563EB) else Color(0xEE1E293B), RoundedCornerShape(8.dp))
-            .border(1.dp, Color(0xFF475569), RoundedCornerShape(8.dp))
-            .clickable { onClick() }
-            .padding(horizontal = 11.dp, vertical = 7.dp)
-    ) {
-        Text(text = text, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Black)
-    }
-}
-
-@Composable
-private fun CompactMapTile(modifier: Modifier = Modifier, label: String, value: String, accentColor: Color, cardBg: Color, borderCol: Color) {
-    Column(
-        modifier = modifier
-            .background(cardBg, RoundedCornerShape(10.dp))
-            .border(1.dp, borderCol, RoundedCornerShape(10.dp))
-            .padding(horizontal = 8.dp, vertical = 6.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Text(text = label, color = Color(0xFF94A3B8), fontSize = 9.sp, fontWeight = FontWeight.ExtraBold)
-        Text(text = value, color = accentColor, fontSize = 18.sp, fontWeight = FontWeight.Black)
-    }
-}
-
-@Composable
-fun MetricTile(
-    modifier: Modifier = Modifier,
-    label: String,
-    value: String,
-    subValue: String,
-    accentColor: Color,
-    cardBg: Color = Color(0xFF161F30),
-    borderCol: Color = Color(0xFF1E293B),
-    secondaryText: Color = Color(0xFF94A3B8)
-) {
-    Column(
-        modifier = modifier
-            .background(cardBg, RoundedCornerShape(8.dp))
-            .border(1.dp, borderCol, RoundedCornerShape(8.dp))
-            .padding(horizontal = 8.dp, vertical = 6.dp)
-    ) {
-        Text(text = label, color = secondaryText, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
-        Text(text = value, color = accentColor, fontSize = 20.sp, fontWeight = FontWeight.Black)
-        Text(text = subValue, color = secondaryText, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
-    }
+    fun latestState() = snapshot
+    fun latestDiagnostics() = diagnostics
 }
