@@ -339,98 +339,39 @@ fun KarooCleanCockpit(
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
 
-            // 1. ULTRA-CLEAN COMPACT SINGLE-LINE STATUS BAR (NO TOAST NOTIFICATIONS)
+            // 1. MINIMALIST TOP BAR (ONLY PAGE INDICATOR + DAY/NIGHT TOGGLE)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(Color(0xFF0B111E))
-                    .padding(horizontal = 8.dp, vertical = 5.dp),
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                val activeSec = if (diag.isRecordingRide) diag.recordingElapsedSeconds.toInt() else elapsedRideSec
-                val mins = (activeSec / 60).toString().padStart(2, '0')
-                val secs = (activeSec % 60).toString().padStart(2, '0')
-                val recBadge = if (diag.isRecordingRide) "REC" else "PAUSA"
-                val gpsTag = if (diag.gpsFixActive) "GPS OK" else "GPS"
-                val statusText = "$recBadge $mins:$secs • $gpsTag • ${diag.altitudeMeters.toInt()}m"
-
+                val pageNames = listOf("1. DATOS", "2. MAPA 3D", "3. VIENTO", "4. IA PRO")
                 Text(
-                    text = statusText,
-                    color = if (diag.isRecordingRide) Color(0xFFF87171) else Color(0xFF34D399),
+                    text = "PÁG ${currentPage + 1}/4 • ${pageNames[currentPage]}",
+                    color = Color(0xFFFACC15),
                     fontSize = 11.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    maxLines = 1
+                    fontWeight = FontWeight.Black
                 )
 
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                Box(
+                    modifier = Modifier
+                        .background(Color(0xFF1E293B), RoundedCornerShape(6.dp))
+                        .clickable { onToggleDaylight() }
+                        .padding(horizontal = 9.dp, vertical = 4.dp)
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .background(
-                                if (diag.demoModeEnabled) Color(0xFFD97706) else Color(0xFF059669),
-                                RoundedCornerShape(6.dp)
-                            )
-                            .clickable { SharedTelemetryBus.setDemoMode(!diag.demoModeEnabled) }
-                            .padding(horizontal = 8.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = if (diag.demoModeEnabled) "DEMO" else "REAL",
-                            color = Color.White,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Black
-                        )
-                    }
-
-                    Box(
-                        modifier = Modifier
-                            .background(Color(0xFF1E293B), RoundedCornerShape(6.dp))
-                            .clickable { onToggleDaylight() }
-                            .padding(horizontal = 7.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = if (daylightMode) "☀️" else "🌙",
-                            fontSize = 10.sp
-                        )
-                    }
+                    Text(
+                        text = if (daylightMode) "☀️ Modo Día" else "🌙 Modo Noche",
+                        color = Color.White,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
 
-            // 2. CLEAN 4-TAB NAVIGATION BAR
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF0F172A))
-                    .padding(horizontal = 6.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                val tabs = listOf("1. DATOS", "2. MAPA 3D", "3. VIENTO", "4. IA PRO")
-                tabs.forEachIndexed { idx, title ->
-                    val active = currentPage == idx
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .background(
-                                if (active) Color(0xFFFACC15) else Color(0xFF1E293B),
-                                RoundedCornerShape(8.dp)
-                            )
-                            .clickable { onSelectPage(idx) }
-                            .padding(vertical = 7.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = title,
-                            color = if (active) Color(0xFF0F172A) else Color(0xFFCBD5E1),
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Black
-                        )
-                    }
-                }
-            }
-
-            // 3. MAIN PAGE CONTENT (4 UNCLUTTERED PRO SCREENS)
+            // 2. MAIN PAGE CONTENT (MAXIMUM VERTICAL SPACE FOR CYCLING METRICS)
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -488,7 +429,7 @@ fun KarooCleanCockpit(
                 }
             }
 
-            // 4. COMPACT HARDWARE BUTTON BAR (◀ PÁG | INICIAR RUTA / FIN STRAVA GPX | PÁG ▶)
+            // 3. COMPACT HARDWARE BUTTON BAR (◀ PÁG | INICIAR RUTA / FIN STRAVA GPX | PÁG ▶)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -585,7 +526,6 @@ private fun EssentialRideMetricsPage(
             .padding(6.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        // 1. HERO CARD: GARMIN EDGE REAL-TIME COLOR POWER GAUGE + 30S ZONE BAR CHART + AVG/MAX/NP
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -807,7 +747,6 @@ private fun EssentialRideMetricsPage(
                 }
             }
 
-            // GARMIN SCORE LINEAR COLOR BAR WITH LIVE SLIDING POINTER & AI TARGET MARKER
             GarminPowerScoreBar(
                 powerWatts = metrics.power3s,
                 aiTargetWatts = ai.adaptiveTargetWatts,
@@ -815,7 +754,6 @@ private fun EssentialRideMetricsPage(
             )
         }
 
-        // 2. MIDDLE ROW 1: VELOCIDAD (KM/H) & FRECUENCIA CARDÍACA (BPM)
         Row(modifier = Modifier.fillMaxWidth().weight(0.95f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             BigMetricCard(
                 modifier = Modifier.weight(1f).fillMaxHeight(),
@@ -837,7 +775,6 @@ private fun EssentialRideMetricsPage(
             )
         }
 
-        // 3. MIDDLE ROW 2: CADENCIA (RPM) & PENDIENTE (%)
         Row(modifier = Modifier.fillMaxWidth().weight(0.95f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             BigMetricCard(
                 modifier = Modifier.weight(1f).fillMaxHeight(),
@@ -887,24 +824,12 @@ private fun GarminPowerScoreBar(
     activeZone: Int
 ) {
     val zoneColors = listOf(
-        Color(0xFF94A3B8), // Z1
-        Color(0xFF3B82F6), // Z2
-        Color(0xFF10B981), // Z3
-        Color(0xFFFACC15), // Z4
-        Color(0xFFF97316), // Z5
-        Color(0xFFEF4444), // Z6
-        Color(0xFFA855F7)  // Z7
+        Color(0xFF94A3B8), Color(0xFF3B82F6), Color(0xFF10B981),
+        Color(0xFFFACC15), Color(0xFFF97316), Color(0xFFEF4444), Color(0xFFA855F7)
     )
 
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(2.dp)
-    ) {
-        Canvas(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(14.dp)
-        ) {
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Canvas(modifier = Modifier.fillMaxWidth().height(14.dp)) {
             val w = size.width
             val h = size.height
             val gap = 3.dp.toPx()
@@ -924,40 +849,15 @@ private fun GarminPowerScoreBar(
                 )
             }
 
-            // AI Target Marker (Cyan Triangle / Line)
             val targetX = ((aiTargetWatts / 420f).coerceIn(0.02f, 0.98f)) * w
-            drawLine(
-                color = Color(0xFF38BDF8),
-                start = Offset(targetX, 0f),
-                end = Offset(targetX, h),
-                strokeWidth = 2.5.dp.toPx()
-            )
+            drawLine(Color(0xFF38BDF8), Offset(targetX, 0f), Offset(targetX, h), strokeWidth = 2.5.dp.toPx())
 
-            // Live Rider Power Score Pointer (High-Contrast White Pill with Dark Core)
             val pointerX = ((powerWatts / 420f).coerceIn(0.02f, 0.98f)) * w
-            val pointerPath = Path().apply {
-                moveTo(pointerX, 0f)
-                lineTo(pointerX - 5.dp.toPx(), h)
-                lineTo(pointerX + 5.dp.toPx(), h)
-                close()
-            }
-            drawPath(pointerPath, Color.White)
-            drawCircle(
-                color = Color.White,
-                radius = 5.5.dp.toPx(),
-                center = Offset(pointerX, h / 2f)
-            )
-            drawCircle(
-                color = Color(0xFF0F172A),
-                radius = 2.5.dp.toPx(),
-                center = Offset(pointerX, h / 2f)
-            )
+            drawCircle(Color.White, radius = 5.5.dp.toPx(), center = Offset(pointerX, h / 2f))
+            drawCircle(Color(0xFF0F172A), radius = 2.5.dp.toPx(), center = Offset(pointerX, h / 2f))
         }
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             for (z in 1..7) {
                 val isCurrent = z == activeZone
                 Text(
@@ -1691,28 +1591,5 @@ private fun CompactMapTile(modifier: Modifier = Modifier, label: String, value: 
     ) {
         Text(text = label, color = Color(0xFF94A3B8), fontSize = 9.sp, fontWeight = FontWeight.ExtraBold)
         Text(text = value, color = accentColor, fontSize = 18.sp, fontWeight = FontWeight.Black)
-    }
-}
-
-@Composable
-fun MetricTile(
-    modifier: Modifier = Modifier,
-    label: String,
-    value: String,
-    subValue: String,
-    accentColor: Color,
-    cardBg: Color = Color(0xFF161F30),
-    borderCol: Color = Color(0xFF1E293B),
-    secondaryText: Color = Color(0xFF94A3B8)
-) {
-    Column(
-        modifier = modifier
-            .background(cardBg, RoundedCornerShape(8.dp))
-            .border(1.dp, borderCol, RoundedCornerShape(8.dp))
-            .padding(horizontal = 8.dp, vertical = 6.dp)
-    ) {
-        Text(text = label, color = secondaryText, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
-        Text(text = value, color = accentColor, fontSize = 20.sp, fontWeight = FontWeight.Black)
-        Text(text = subValue, color = secondaryText, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
     }
 }
