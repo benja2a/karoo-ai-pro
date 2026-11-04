@@ -807,29 +807,15 @@ private fun EssentialRideMetricsPage(
                 }
             }
 
-            // Garmin 7-Zone Color Bar at the bottom of the Hero Card
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(6.dp),
-                horizontalArrangement = Arrangement.spacedBy(3.dp)
-            ) {
-                for (z in 1..7) {
-                    val col = garminZoneColor(z)
-                    val active = z == metrics.powerZone
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight()
-                            .background(
-                                if (active) col else col.copy(alpha = 0.22f),
-                                RoundedCornerShape(3.dp)
-                            )
-                    )
-                }
-            }
+            // GARMIN SCORE LINEAR COLOR BAR WITH LIVE SLIDING POINTER & AI TARGET MARKER
+            GarminPowerScoreBar(
+                powerWatts = metrics.power3s,
+                aiTargetWatts = ai.adaptiveTargetWatts,
+                activeZone = metrics.powerZone
+            )
         }
 
+        // 2. MIDDLE ROW 1: VELOCIDAD (KM/H) & FRECUENCIA CARDÍACA (BPM)
         Row(modifier = Modifier.fillMaxWidth().weight(0.95f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             BigMetricCard(
                 modifier = Modifier.weight(1f).fillMaxHeight(),
@@ -851,6 +837,7 @@ private fun EssentialRideMetricsPage(
             )
         }
 
+        // 3. MIDDLE ROW 2: CADENCIA (RPM) & PENDIENTE (%)
         Row(modifier = Modifier.fillMaxWidth().weight(0.95f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             BigMetricCard(
                 modifier = Modifier.weight(1f).fillMaxHeight(),
@@ -889,6 +876,97 @@ private fun EssentialRideMetricsPage(
             )
             CompactStatItem("W' RESERVA", "${metrics.wPrimePercent}% (${metrics.wPrimeBalanceKj}kJ)", Color(0xFFA855F7), secondaryText)
             CompactStatItem("CARGA TSS", "${metrics.tss}", Color(0xFFFACC15), secondaryText)
+        }
+    }
+}
+
+@Composable
+private fun GarminPowerScoreBar(
+    powerWatts: Int,
+    aiTargetWatts: Int,
+    activeZone: Int
+) {
+    val zoneColors = listOf(
+        Color(0xFF94A3B8), // Z1
+        Color(0xFF3B82F6), // Z2
+        Color(0xFF10B981), // Z3
+        Color(0xFFFACC15), // Z4
+        Color(0xFFF97316), // Z5
+        Color(0xFFEF4444), // Z6
+        Color(0xFFA855F7)  // Z7
+    )
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(14.dp)
+        ) {
+            val w = size.width
+            val h = size.height
+            val gap = 3.dp.toPx()
+            val segW = (w - gap * 6f) / 7f
+
+            for (i in 0..6) {
+                val isCurrent = (i + 1) == activeZone
+                val col = zoneColors[i]
+                val left = i * (segW + gap)
+                val barTop = if (isCurrent) 1.dp.toPx() else 3.dp.toPx()
+                val barHeight = if (isCurrent) h - 2.dp.toPx() else h - 6.dp.toPx()
+
+                drawRect(
+                    color = if (isCurrent) col else col.copy(alpha = 0.32f),
+                    topLeft = Offset(left, barTop),
+                    size = Size(segW, barHeight)
+                )
+            }
+
+            // AI Target Marker (Cyan Triangle / Line)
+            val targetX = ((aiTargetWatts / 420f).coerceIn(0.02f, 0.98f)) * w
+            drawLine(
+                color = Color(0xFF38BDF8),
+                start = Offset(targetX, 0f),
+                end = Offset(targetX, h),
+                strokeWidth = 2.5.dp.toPx()
+            )
+
+            // Live Rider Power Score Pointer (High-Contrast White Pill with Dark Core)
+            val pointerX = ((powerWatts / 420f).coerceIn(0.02f, 0.98f)) * w
+            val pointerPath = Path().apply {
+                moveTo(pointerX, 0f)
+                lineTo(pointerX - 5.dp.toPx(), h)
+                lineTo(pointerX + 5.dp.toPx(), h)
+                close()
+            }
+            drawPath(pointerPath, Color.White)
+            drawCircle(
+                color = Color.White,
+                radius = 5.5.dp.toPx(),
+                center = Offset(pointerX, h / 2f)
+            )
+            drawCircle(
+                color = Color(0xFF0F172A),
+                radius = 2.5.dp.toPx(),
+                center = Offset(pointerX, h / 2f)
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            for (z in 1..7) {
+                val isCurrent = z == activeZone
+                Text(
+                    text = "Z$z",
+                    color = if (isCurrent) zoneColors[z - 1] else Color(0xFF64748B),
+                    fontSize = 8.sp,
+                    fontWeight = FontWeight.Black
+                )
+            }
         }
     }
 }
